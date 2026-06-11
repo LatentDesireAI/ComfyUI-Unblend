@@ -114,20 +114,19 @@ def activation_hw(seq_len, latent_h, latent_w):
 
 
 def build_masks_from_maps(char_maps, latent_h, latent_w, map_threshold=0.35,
-                          min_area_frac=0.02, fg=None, smooth=2, peak_min=2.0):
+                          min_area_frac=0.02, fg=None, smooth=2, max_share=0.85):
     """Накопленные attn-карты -> жёсткие взаимоисключающие маски.
 
     Алгоритм:
       1. апсемпл до латента + сглаживание (box-blur);
-      2. отбраковка нелокализованных карт по «пиковости» max/mean < peak_min
-         (равномерная/размазанная карта = персонаж не локализовался);
-      3. каждая принятая карта шкалируется СВОИМ максимумом — персонажи
-         соревнуются на равных (первый в промпте обычно собирает больше
-         внимания и иначе затапливает кадр);
-      4. пиксель -> победитель argmax, если его шкалированное значение
-         > map_threshold, иначе фон.
+      2. каждая карта шкалируется СВОИМ максимумом (внутри домена) —
+         персонажи соревнуются на равных, первый-в-промпте не получает форы;
+      3. пиксель -> победитель argmax, если его значение > map_threshold;
+      4. защита от потопа: карта, захватившая > max_share доступной зоны
+         (силуэт fg, иначе весь кадр) — мусорная «размазня», выбывает,
+         и выжившие пересоревновываются без неё.
 
-    fg: опционально (latent_h, latent_w) маска силуэта 0/1 — уточнение.
+    fg: опционально маска силуэта 0/1 (любого размера) — домен борьбы.
     Возвращает (masks (n, H, W) float32 torch, background (H, W), ok_flags).
     """
     n = len(char_maps)
@@ -142,36 +141,47 @@ def build_masks_from_maps(char_maps, latent_h, latent_w, map_threshold=0.35,
     if smooth > 0:
         stack = feather_masks(stack / stack.max().clamp(min=1e-12), smooth)
 
-    # пиковость: насколько карта локализована
-    flat = stack.view(n, -1)
-    peaked = (flat.max(dim=1).values /
-              flat.mean(dim=1).clamp(min=1e-12)) >= peak_min
-
-    # шкала своим максимумом (только принятые карты участвуют в борьбе)
-    scaled = torch.zeros_like(stack)
-    for i in range(n):
-        if peaked[i]:
-            mx = float(stack[i].max())
-            if mx > 0:
-                scaled[i] = stack[i] / mx
-
     if fg is not None:
-        fg_t = torch.as_tensor(fg, dtype=torch.float32)
+        fg_t = torch.as_tensor(np.asarray(fg), dtype=torch.float32)
         if fg_t.shape != (latent_h, latent_w):
             fg_t = F.interpolate(fg_t.view(1, 1, *fg_t.shape),
                                  size=(latent_h, latent_w), mode="bilinear",
                                  align_corners=False)[0, 0]
-        scaled = scaled * (fg_t > 0.5).float()
+        domain = (fg_t > 0.5).float()
+        if float(domain.sum()) < min_area_frac * latent_h * latent_w:
+            domain = torch.ones(latent_h, latent_w)  # силуэт пустой — игнор
+    else:
+        domain = torch.ones(latent_h, latent_w)
+    domain_area = float(domain.sum())
 
-    best_val, best_idx = scaled.max(dim=0)
-    masks = torch.zeros_like(scaled)
-    for i in range(n):
-        masks[i] = ((best_idx == i) & (best_val > map_threshold)).float()
+    active = [float((stack[i] * domain).max()) > 0 for i in range(n)]
+    masks = torch.zeros_like(stack)
+    for _ in range(n):
+        scaled = torch.zeros_like(stack)
+        for i in range(n):
+            if not active[i]:
+                continue
+            mi = stack[i] * domain
+            mx = float(mi.max())
+            if mx > 0:
+                scaled[i] = mi / mx
+        best_val, best_idx = scaled.max(dim=0)
+        masks = torch.zeros_like(scaled)
+        for i in range(n):
+            if active[i]:
+                masks[i] = ((best_idx == i) & (best_val > map_threshold)).float()
+        floods = [i for i in range(n) if active[i]
+                  and float(masks[i].sum()) > max_share * domain_area]
+        if not floods:
+            break
+        for i in floods:
+            active[i] = False
+            masks[i] = torch.zeros(latent_h, latent_w)
 
     ok = []
     total = latent_h * latent_w
     for i in range(n):
-        ok.append(bool(peaked[i].item())
+        ok.append(active[i]
                   and bool(masks[i].sum().item() >= min_area_frac * total))
 
     background = (masks.sum(dim=0) < 0.5).float()
