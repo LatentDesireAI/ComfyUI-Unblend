@@ -160,6 +160,21 @@ areas = [float(vm[i].mean()) for i in range(2)]
 ratio = max(areas) / max(min(areas), 1e-9)
 check("voronoi сбалансирован", ratio < 1.5, f"ratio={ratio:.2f}")
 
+# ── _stabilize_identity: прилипание личностей между refresh'ами ────────────
+st2 = ac._DynamicState({0: [5], 1: [10]}, 4, 2, 0.35, 1.0, 1.0, 4096)
+st2.latent_hw = (H, W)
+st2.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1})  # char0=лево, char1=право
+
+# новые маски: строка 0 = ПРАВО, строка 1 = ЛЕВО (геометрия та же, строки наоборот)
+new_masks = torch.stack([m2, m1])
+rm = ac._stabilize_identity(st2, new_masks, {0: 0, 1: 1})
+check("identity: переворот пойман", rm == {0: 1, 1: 0}, str(rm))
+rm2 = ac._stabilize_identity(st2, torch.stack([m1, m2]), {0: 0, 1: 1})
+check("identity: прямое совпадение не трогаем", rm2 == {0: 0, 1: 1}, str(rm2))
+st_empty = ac._DynamicState({0: [5], 1: [10]}, 4, 2, 0.35, 1.0, 1.0, 4096)
+rm3 = ac._stabilize_identity(st_empty, new_masks, {0: 0, 1: 1})
+check("identity: без прежних масок без изменений", rm3 == {0: 0, 1: 1}, str(rm3))
+
 print()
 print("ИТОГ:", "все тесты прошли" if not fails else f"ПРОВАЛЕНО: {fails}")
 sys.exit(1 if fails else 0)

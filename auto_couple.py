@@ -1134,6 +1134,33 @@ def voronoi_char_masks(fg, head_boxes, latent_h, latent_w):
     return torch.stack(masks)
 
 
+def _stabilize_identity(state, new_masks, rows_map):
+    """Не дать персонажам «поменяться местами» между refresh'ами.
+
+    Affinity пересчитывается каждый refresh независимо; если карты качнулись,
+    личности могут перевернуться — bias перевернётся посреди генерации.
+    Прилипание по IoU с предыдущими масками (для 2 персонажей).
+    """
+    if state.masks is None or len(rows_map) != 2:
+        return rows_map
+    cis = sorted(rows_map)
+    if any(ci not in state.char_rows for ci in cis):
+        return rows_map
+    prev = {ci: state.masks[state.char_rows[ci]] for ci in cis}
+
+    def iou(a, b):
+        inter = float((a * b).sum())
+        union = float(((a + b) > 0.5).float().sum())
+        return inter / union if union > 0 else 0.0
+
+    direct = sum(iou(new_masks[rows_map[ci]], prev[ci]) for ci in cis)
+    swapped = (iou(new_masks[rows_map[cis[1]]], prev[cis[0]])
+               + iou(new_masks[rows_map[cis[0]]], prev[cis[1]]))
+    if swapped > direct + 1e-6:
+        return {cis[0]: rows_map[cis[1]], cis[1]: rows_map[cis[0]]}
+    return rows_map
+
+
 def _dyn_attn2_replace(state):
     """Attention с bias по маскам + харвест карт. Заменяет attn2."""
 
@@ -1317,6 +1344,9 @@ class UnblendDynamicSampler:
                     img = (np.clip(img_t[0].cpu().numpy(), 0, 1) * 255).astype(np.uint8)
                     pil = Image.fromarray(img, "RGB")
                     fg = silhouette_fg(pil)
+                    if fg is not None and float(np.asarray(fg).mean()) < 0.02:
+                        _log(done, "силуэт пустой — игнорирую его в этот раз")
+                        fg = None
                 except Exception as e:
                     print(f"[UnblendDynamic] силуэт не получился: {e}")
 
@@ -1336,13 +1366,21 @@ class UnblendDynamicSampler:
                             order = sorted(assign)
                             vmasks = voronoi_char_masks(
                                 fg, [heads[assign[ci]] for ci in order], H, W)
-                            state.set_masks(
-                                vmasks, {ci: r for r, ci in enumerate(order)})
+                            fr = [float(vmasks[i].mean())
+                                  for i in range(vmasks.shape[0])]
+                            if min(fr) < 0.03:
+                                # пустые/вырожденные маски ХУЖЕ отсутствия:
+                                # bias заглушит токены персонажей везде
+                                _log(done, f"heads-маски вырождены "
+                                           f"{[f'{a*100:.0f}%' for a in fr]} — "
+                                           f"не обновляю")
+                                return
+                            rows_map = {ci: r for r, ci in enumerate(order)}
+                            rows_map = _stabilize_identity(state, vmasks, rows_map)
+                            state.set_masks(vmasks, rows_map)
                             state.last_mode = "heads+attn-id"
-                            areas = [f"{vmasks[i].mean() * 100:.0f}%"
-                                     for i in range(vmasks.shape[0])]
                             _log(done, f"heads={len(heads)} -> heads+attn-id, "
-                                       f"маски {areas}")
+                                       f"маски {[f'{a*100:.0f}%' for a in fr]}")
                             return
                     _log(done, f"heads={len(heads)} (<2) -> attn-only")
                 except Exception as e:
