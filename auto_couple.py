@@ -1,0 +1,800 @@
+"""
+ComfyUI-Unblend :: auto_couple.py
+=================================
+Одно-проходная генерация с разделением персонажей БЕЗ черновика
+(Bounded-Attention-style, адаптировано под ComfyUI и аниме-дуо).
+
+Идея: модель сама знает, где она рисует каждого персонажа — cross-attention
+её токенов локализуется в пространстве уже на ранних шагах. Поэтому:
+
+  Фаза 1 (0 .. switch_at): обычный сэмплинг полным промптом (draw).
+          Попутно с блоков UNet снимаются cross-attn карты токенов
+          каждого [CHARn] — накапливаются в пространственные карты.
+  Переключение: из карт строятся маски персонажей (+ опционально
+          уточняются силуэтом/детектом по x0-предсказанию).
+  Фаза 2 (switch_at .. конец): продолжение С ПАТЧАМИ:
+          - cross-attn couple: промпт CHARn действует только в его маске
+          - self-attn jail: пиксели персонажа A не могут «смотреть» на
+            пиксели персонажа B (главный канал утечки черт, который
+            не закрывают A8R8/PPM) — фон остаётся общим.
+
+Ноды:
+  UnblendBoundedSampler — сэмплер-комбайн: тегированный промпт на входе,
+        латент на выходе. До 4 персонажей.
+  UnblendCoupleApply    — только патч couple+jail по готовым маскам
+        (drop-in замена A8R8 AttentionCouple для SDXL, бонус — jail).
+
+v1: SDXL/Illustrious и совместимые UNet-файнтюны. Anima (DiT/Cosmos) — НЕ
+поддержана этим ядром (другая архитектура; для неё пока PPM, интеграция позже).
+
+Известная механика couple (конкат кондишенов по батчу до проекций to_k/to_v +
+помасочная сборка в output-патче) идёт из линейки laksjdjf/hako-mikan/A8R8/PPM;
+реализация ниже написана с нуля. Self-attn jail — по мотивам статьи
+"Be Yourself: Bounded Attention for Multi-Subject Text-to-Image" (2024).
+"""
+
+import math
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from .prompt_builder import build_blocks, parse_prompt, _clean
+
+_CLIP_START = 49406
+_CLIP_END = 49407
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Чистые хелперы (без comfy-импортов — тестируются автономно)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def flatten_token_ids(tokenized_chunks):
+    """clip.tokenize()["g"] -> плоский список id с сохранением позиций.
+
+    Каждый чанк — список пар (token, weight); token может быть тензором
+    (embedding:xxx) — заменяем на -1 (позиция занята, сравнивать нельзя).
+    """
+    flat = []
+    for chunk in tokenized_chunks:
+        for entry in chunk:
+            tok = entry[0]
+            flat.append(int(tok) if isinstance(tok, (int, np.integer)) else -1)
+    return flat
+
+
+def strip_specials(ids):
+    """Убрать start/end/pad токены CLIP с краёв и хвостовые повторы end."""
+    out = [t for t in ids if t not in (_CLIP_START,)]
+    # хвост из end-токенов (паддинг ComfyUI добивает end'ами или нулями)
+    while out and out[-1] in (_CLIP_END, 0):
+        out.pop()
+    return [t for t in out if t != _CLIP_END]
+
+
+def find_subsequence(haystack, needle):
+    """Позиции needle в haystack (точное вхождение). None если не нашли.
+
+    Возвращает список индексов haystack, занятых needle. Если целиком не
+    нашлось (например, чанк-граница 77 токенов разорвала кусок) — ищем
+    самый длинный префикс/суффикс >= 60% длины.
+    """
+    n, h = len(needle), len(haystack)
+    if n == 0 or h == 0:
+        return None
+    for start in range(h - n + 1):
+        if haystack[start:start + n] == needle:
+            return list(range(start, start + n))
+    # фолбэк: частичное совпадение (разрыв чанком)
+    min_len = max(1, math.ceil(n * 0.6))
+    for take in range(n - 1, min_len - 1, -1):
+        for off in (0, n - take):  # префикс, потом суффикс
+            part = needle[off:off + take]
+            for start in range(h - take + 1):
+                if haystack[start:start + take] == part:
+                    return list(range(start, start + take))
+    return None
+
+
+def activation_hw(seq_len, latent_h, latent_w):
+    """seq_len attention-блока + размер латента -> (h, w) активации.
+
+    UNet даунсемплит латент в 1/2/4/8 раз; ищем точное совпадение.
+    """
+    for ds in (1, 2, 4, 8):
+        h = math.ceil(latent_h / ds)
+        w = math.ceil(latent_w / ds)
+        if h * w == seq_len:
+            return h, w
+    # не нашли точно (нестандартный размер) — приближение по пропорции
+    d = math.sqrt(latent_h * latent_w / seq_len)
+    h = max(1, round(latent_h / d))
+    w = max(1, seq_len // h)
+    return h, w
+
+
+def build_masks_from_maps(char_maps, latent_h, latent_w, map_threshold=0.35,
+                          min_area_frac=0.02, fg=None):
+    """Накопленные attn-карты -> жёсткие взаимоисключающие маски.
+
+    char_maps: список (H?, W?) тензоров/массивов (у каждого персонажа своя),
+               уже в латентном разрешении НЕ обязаны быть — апсемплим тут.
+    fg:        опционально (latent_h, latent_w) маска силуэта 0/1 — карты
+               умножаются на неё (уточнение «hybrid»).
+    Возвращает (masks (n, H, W) float32 torch, background (H, W), ok_flags).
+    """
+    n = len(char_maps)
+    ups = []
+    for m in char_maps:
+        t = torch.as_tensor(m, dtype=torch.float32)
+        t = t.view(1, 1, *t.shape)
+        t = F.interpolate(t, size=(latent_h, latent_w), mode="bilinear",
+                          align_corners=False)[0, 0]
+        ups.append(t)
+    stack = torch.stack(ups)  # (n, H, W)
+    # ВАЖНО: нормируем ОБЩИМ максимумом, не каждым своим — иначе слабая
+    # «размазанная» карта (персонаж не локализовался) затопит весь кадр.
+    gmax = float(stack.max())
+    if gmax > 0:
+        stack = stack / gmax
+
+    if fg is not None:
+        fg_t = torch.as_tensor(fg, dtype=torch.float32)
+        if fg_t.shape != (latent_h, latent_w):
+            fg_t = F.interpolate(fg_t.view(1, 1, *fg_t.shape),
+                                 size=(latent_h, latent_w), mode="bilinear",
+                                 align_corners=False)[0, 0]
+        stack = stack * (fg_t > 0.5).float()
+
+    best_val, best_idx = stack.max(dim=0)
+    masks = torch.zeros_like(stack)
+    for i in range(n):
+        masks[i] = ((best_idx == i) & (best_val > map_threshold)).float()
+
+    ok = []
+    total = latent_h * latent_w
+    for i in range(n):
+        ok.append(bool(masks[i].sum().item() >= min_area_frac * total))
+
+    background = (masks.sum(dim=0) < 0.5).float()
+    return masks, background, ok
+
+
+def feather_masks(masks, feather):
+    """Мягкие края: box-blur ядром (2f+1), маски остаются нормированными суммой далее."""
+    if feather <= 0:
+        return masks
+    k = 2 * int(feather) + 1
+    pad = k // 2
+    m = masks.unsqueeze(1)  # (n,1,H,W)
+    kernel = torch.ones(1, 1, k, k, dtype=m.dtype) / (k * k)
+    m = F.conv2d(F.pad(m, (pad, pad, pad, pad), mode="replicate"), kernel)
+    return m.squeeze(1).clamp(0, 1)
+
+
+def labels_from_masks(masks, h, w):
+    """(n, H, W) маски -> (h*w,) long: 0=фон, i+1=персонаж i (для jail-bias)."""
+    m = F.interpolate(masks.unsqueeze(1), size=(h, w), mode="bilinear",
+                      align_corners=False).squeeze(1)  # (n, h, w)
+    best_val, best_idx = m.max(dim=0)
+    lab = torch.where(best_val > 0.5, best_idx + 1, torch.zeros_like(best_idx))
+    return lab.view(-1)
+
+
+def jail_bias(labels, strength=1.0, dtype=torch.float32):
+    """(seq,) labels -> (seq, seq) additive bias: -1e4 между разными персонажами."""
+    li = labels.view(-1, 1)
+    lj = labels.view(1, -1)
+    blocked = (li != lj) & (li > 0) & (lj > 0)
+    bias = torch.zeros(li.shape[0], lj.shape[1], dtype=dtype)
+    bias[blocked] = -10000.0 * float(strength)
+    return bias
+
+
+def _lcm_list(values):
+    out = 1
+    for v in values:
+        out = math.lcm(out, v)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Couple + jail патчи (общие для обеих нод)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _CoupleState:
+    """Состояние, разделяемое attn2_patch / attn2_output_patch / attn1_replace."""
+
+    def __init__(self, region_conds, masks_norm, labels_masks, jail_strength,
+                 jail_max_seq):
+        # region_conds: список сырых cond-тензоров (1, t_i, dim) БЕЗ base
+        # masks_norm: (1 + n_regions, H, W), нормированы суммой по dim 0
+        self.region_conds = region_conds
+        self.masks = masks_norm
+        self.labels_masks = labels_masks      # (n_regions, H, W) для jail
+        self.jail_strength = jail_strength
+        self.jail_max_seq = jail_max_seq
+        self.latent_hw = None                 # (H_lat, W_lat) с original_shape
+        self.batch_size = 1
+        self._bias_cache = {}
+        self._mask_cache = {}
+
+    @property
+    def num_conds(self):
+        return 1 + len(self.region_conds)
+
+    def mask_for_seq(self, seq_len, device, dtype):
+        key = (seq_len, str(device), dtype)
+        if key not in self._mask_cache:
+            h, w = activation_hw(seq_len, *self.latent_hw)
+            m = F.interpolate(self.masks.unsqueeze(1), size=(h, w),
+                              mode="bilinear", align_corners=False)
+            m = m.reshape(self.num_conds, -1)[:, :seq_len]
+            # нормировка суммой на пиксель (после интерполяции может уплыть)
+            m = m / m.sum(dim=0, keepdim=True).clamp(min=1e-6)
+            self._mask_cache[key] = m.to(device, dtype=dtype)
+        return self._mask_cache[key]
+
+    def bias_for_seq(self, seq_len, device, dtype):
+        key = (seq_len, str(device), dtype)
+        if key not in self._bias_cache:
+            h, w = activation_hw(seq_len, *self.latent_hw)
+            labels = labels_from_masks(self.labels_masks, h, w)[:seq_len]
+            self._bias_cache[key] = jail_bias(
+                labels, self.jail_strength, dtype=torch.float32
+            ).to(device, dtype=dtype)
+        return self._bias_cache[key]
+
+
+def _attn2_patch(state):
+    """Конкат region-кондишенов по батчу ДО проекций to_k/to_v."""
+
+    def patch(q, k, v, extra_options):
+        # q: (B, seq_q, hidden_img); k == v == сырой текст-контекст (B, t, 2048)
+        cou = extra_options["cond_or_uncond"]
+        chunks = len(cou)
+        state.batch_size = bsz = q.shape[0] // chunks
+        state.latent_hw = tuple(extra_options["original_shape"][-2:])
+
+        device, dtype = k.device, k.dtype
+        conds = [c.to(device, dtype=dtype) for c in state.region_conds]
+        tok_lens = [c.shape[1] for c in conds] + [k.shape[1]]
+        L = _lcm_list(tok_lens)
+
+        q_chunks = q.chunk(chunks, dim=0)
+        k_chunks = k.chunk(chunks, dim=0)
+
+        qs, ks = [], []
+        for i, flag in enumerate(cou):
+            k_rep = k_chunks[i].repeat(1, L // k.shape[1], 1)
+            if flag == 1:  # uncond — без изменений
+                qs.append(q_chunks[i])
+                ks.append(k_rep)
+            else:          # cond — base (из сэмплера) + регионы
+                qs.append(q_chunks[i].repeat(state.num_conds, 1, 1))
+                extra = torch.cat(
+                    [c.repeat(bsz, L // c.shape[1], 1) for c in conds], dim=0)
+                ks.append(torch.cat([k_rep, extra], dim=0))
+
+        qs = torch.cat(qs, dim=0)
+        ks = torch.cat(ks, dim=0)
+        return qs, ks, ks
+
+    return patch
+
+
+def _attn2_output_patch(state):
+    """Сборка выхода attention по маскам регионов."""
+
+    def patch(out, extra_options):
+        cou = extra_options["cond_or_uncond"]
+        bsz = state.batch_size
+        n = state.num_conds
+        seq = out.shape[1]
+        mask = state.mask_for_seq(seq, out.device, out.dtype)  # (n, seq)
+        mask = mask.view(n, 1, seq, 1)
+
+        outputs, pos = [], 0
+        for flag in cou:
+            if flag == 1:
+                outputs.append(out[pos:pos + bsz])
+                pos += bsz
+            else:
+                block = out[pos:pos + n * bsz].view(n, bsz, seq, -1)
+                outputs.append((block * mask).sum(dim=0))
+                pos += n * bsz
+        return torch.cat(outputs, dim=0)
+
+    return patch
+
+
+def _attn1_replace(state):
+    """Self-attention jail: блокируем внимание между пикселями разных персонажей."""
+
+    def patch(q, k, v, extra_options):
+        heads = extra_options["n_heads"]
+        b, seq_q, inner = q.shape
+        dim_head = inner // heads
+
+        def split(t):
+            return t.view(b, -1, heads, dim_head).transpose(1, 2)
+
+        qh, kh, vh = split(q), split(k), split(v)
+
+        bias = None
+        if (state.latent_hw is not None and seq_q == k.shape[1]
+                and seq_q <= state.jail_max_seq):
+            bias = state.bias_for_seq(seq_q, q.device, q.dtype)
+
+        out = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=bias)
+        return out.transpose(1, 2).reshape(b, seq_q, inner)
+
+    return patch
+
+
+def _register_attn1_everywhere(model_patcher, patch):
+    """Регистрируем attn1-replace на все возможные блоки SDXL UNet.
+
+    Лишние ключи безвредны (никогда не сработают); реальный отбор по
+    seq_len происходит внутри патча.
+    """
+    for name, count in (("input", 12), ("middle", 1), ("output", 12)):
+        for number in range(count):
+            for t_idx in range(10):
+                model_patcher.set_model_attn1_replace(patch, name, number, t_idx)
+
+
+def _check_sdxl(model_patcher):
+    import comfy.model_base as mb
+    mt = type(model_patcher.model)
+    ok = issubclass(mt, (mb.SDXL, mb.SDXLRefiner)) or mt == mb.BaseModel
+    if not ok:
+        raise ValueError(
+            f"[Unblend] это ядро поддерживает SDXL/SD1-UNet, а модель — {mt.__name__}. "
+            "Для Anima (DiT/Cosmos) используй Attention Couple (PPM); "
+            "поддержка Anima в Unblend — в планах.")
+
+
+def apply_couple(model_patcher, region_conds, masks_with_base, labels_masks,
+                 jail=True, jail_strength=1.0, jail_max_seq=4096):
+    """Клонирует модель и вешает couple (+jail) патчи.
+
+    region_conds: сырые cond-тензоры регионов (без base — base идёт через
+                  positive сэмплера).
+    masks_with_base: (1+n, H, W) float, строка 0 = base, уже с bleed;
+                  нормируется здесь.
+    labels_masks: (n, H, W) жёсткие маски регионов для jail.
+    """
+    _check_sdxl(model_patcher)
+    masks = masks_with_base / masks_with_base.sum(dim=0, keepdim=True).clamp(min=1e-6)
+    state = _CoupleState(region_conds, masks, labels_masks,
+                         jail_strength, jail_max_seq)
+    m = model_patcher.clone()
+    m.set_model_attn2_patch(_attn2_patch(state))
+    m.set_model_attn2_output_patch(_attn2_output_patch(state))
+    if jail and len(region_conds) >= 1:
+        _register_attn1_everywhere(m, _attn1_replace(state))
+    return m, state
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Сбор cross-attn карт (фаза 1)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _Harvester:
+    """attn2-replace, который считает обычный attention и копит карты токенов."""
+
+    def __init__(self, spans, max_seq=1100):
+        # spans: {char_idx: [позиции токенов в контексте]} (None — не нашли)
+        self.spans = {i: s for i, s in spans.items() if s}
+        self.max_seq = max_seq
+        self.acc = {}     # char_idx -> (h, w) np.float32 (в координатах карты)
+        self.acc_hw = {}  # char_idx -> (h, w)
+        self.latent_hw = None
+
+    def patch(self):
+        from comfy.ldm.modules.attention import optimized_attention
+
+        def replace(q, k, v, extra_options):
+            heads = extra_options["n_heads"]
+            out = optimized_attention(q, k, v, heads)
+            try:
+                self._harvest(q, k, extra_options)
+            except Exception as e:  # сбор карт не должен ронять сэмплинг
+                if not getattr(self, "_warned", False):
+                    print(f"[UnblendBounded] harvest error (пропускаю): {e}")
+                    self._warned = True
+            return out
+
+        return replace
+
+    @torch.no_grad()
+    def _harvest(self, q, k, extra_options):
+        seq_q = q.shape[1]
+        if seq_q > self.max_seq or not self.spans:
+            return
+        cou = extra_options["cond_or_uncond"]
+        chunks = len(cou)
+        bsz = q.shape[0] // chunks
+        self.latent_hw = tuple(extra_options["original_shape"][-2:])
+        h, w = activation_hw(seq_q, *self.latent_hw)
+
+        heads = extra_options["n_heads"]
+        dim_head = q.shape[2] // heads
+        scale = dim_head ** -0.5
+
+        for i, flag in enumerate(cou):
+            if flag != 0:  # только cond
+                continue
+            qc = q[i * bsz:(i + 1) * bsz]
+            kc = k[i * bsz:(i + 1) * bsz]
+            qh = qc.view(bsz, seq_q, heads, dim_head).transpose(1, 2)
+            kh = kc.view(bsz, -1, heads, dim_head).transpose(1, 2)
+            probs = torch.softmax(qh @ kh.transpose(-1, -2) * scale, dim=-1)
+            probs = probs.mean(dim=1)  # (bsz, seq_q, seq_k) — среднее по головам
+            n_tok = probs.shape[-1]
+            for ci, span in self.spans.items():
+                idx = [p for p in span if p < n_tok]
+                if not idx:
+                    continue
+                # mean по токенам спана: длина описания не должна давать фору
+                m = probs[..., idx].mean(dim=-1).mean(dim=0)  # (seq_q,)
+                m = m.view(h, w).float().cpu().numpy()
+                if ci in self.acc and self.acc_hw[ci] == (h, w):
+                    self.acc[ci] += m
+                else:
+                    if ci in self.acc:  # другое разрешение — приводим
+                        import cv2
+                        old = cv2.resize(self.acc[ci], (w, h),
+                                         interpolation=cv2.INTER_LINEAR)
+                        m = m + old
+                    self.acc[ci] = m
+                    self.acc_hw[ci] = (h, w)
+
+
+def find_char_spans(clip, draw_text, char_texts):
+    """Позиции токенов каждого CHARn внутри токенизированного draw-промпта."""
+    toks = clip.tokenize(draw_text)
+    key = "g" if "g" in toks else ("l" if "l" in toks else next(iter(toks)))
+    hay = flatten_token_ids(toks[key])
+    spans = {}
+    for i, ct in enumerate(char_texts):
+        if not ct:
+            spans[i] = None
+            continue
+        sub = clip.tokenize(ct)
+        needle = strip_specials(flatten_token_ids(sub[key]))
+        spans[i] = find_subsequence(hay, needle)
+    return spans
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Нода 1: UnblendCoupleApply (замена A8R8 для SDXL + jail)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mask2d(mask):
+    m = mask
+    if m.dim() == 3:
+        m = m[0]
+    return m.float().cpu()
+
+
+class UnblendCoupleApply:
+    """Couple + self-attn jail по готовым маскам. SDXL. Замена A8R8 AttentionCouple.
+
+    positive сэмплера = base_cond (тот же, что сюда). Маски — из
+    Char Masks -> Regions (mask_1.., background -> base_mask).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "base_mask": ("MASK",),
+                "base_bleed": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "self_attn_jail": ("BOOLEAN", {"default": True}),
+                "jail_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "jail_max_seq": ("INT", {"default": 4096, "min": 256, "max": 16384, "step": 256}),
+            },
+            "optional": {
+                "cond_1": ("CONDITIONING",), "mask_1": ("MASK",),
+                "cond_2": ("CONDITIONING",), "mask_2": ("MASK",),
+                "cond_3": ("CONDITIONING",), "mask_3": ("MASK",),
+                "cond_4": ("CONDITIONING",), "mask_4": ("MASK",),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "apply"
+    CATEGORY = "Unblend"
+
+    def apply(self, model, base_mask, base_bleed, self_attn_jail,
+              jail_strength, jail_max_seq, **kwargs):
+        region_conds, region_masks = [], []
+        for i in range(1, 5):
+            c, mk = kwargs.get(f"cond_{i}"), kwargs.get(f"mask_{i}")
+            if c is None or mk is None:
+                continue
+            mk2 = _mask2d(mk)
+            if mk2.sum() < 1:
+                continue
+            region_conds.append(c[0][0])
+            region_masks.append(mk2)
+        if not region_conds:
+            raise ValueError("[UnblendCoupleApply] не подключено ни одной пары cond_n/mask_n")
+
+        base2 = _mask2d(base_mask)
+        H, W = base2.shape
+        region_masks = [F.interpolate(m.view(1, 1, *m.shape), size=(H, W),
+                                      mode="bilinear", align_corners=False)[0, 0]
+                        if m.shape != (H, W) else m for m in region_masks]
+        stack = torch.stack([base2 + base_bleed] + region_masks)
+        labels = torch.stack([(m > 0.5).float() for m in region_masks])
+
+        m, _ = apply_couple(model, region_conds, stack, labels,
+                            jail=self_attn_jail, jail_strength=jail_strength,
+                            jail_max_seq=jail_max_seq)
+        return (m,)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Нода 2: UnblendBoundedSampler (одно-проходный комбайн)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class UnblendBoundedSampler:
+    """Промпт с [CHARn] на входе — латент с разделёнными персонажами на выходе.
+
+    Без черновика: маски персонажей берутся из cross-attn карт самой модели
+    на ранних шагах (mask_source=attn_maps), опционально уточняются силуэтом
+    (attn_maps+silhouette, нужен vae) или классическим детектом по x0
+    (x0_detect, нужен vae).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "latent_image": ("LATENT",),
+                "prompt": ("STRING", {"multiline": True, "default":
+                    "[QUALITY] masterpiece, best quality\n"
+                    "[STYLE] anime style\n"
+                    "[SCENE] simple background\n"
+                    "[CHAR1] columbina (genshin impact), black hair, white dress\n"
+                    "[CHAR2] fischl (genshin impact), blonde hair, eyepatch\n"
+                    "[INTERACT] embracing, face to face"}),
+                "negative_prompt": ("STRING", {"multiline": True, "default":
+                    "lowres, worst quality, low quality, bad anatomy, bad hands"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "steps": ("INT", {"default": 30, "min": 4, "max": 200}),
+                "cfg": ("FLOAT", {"default": 5.5, "min": 0.5, "max": 20.0, "step": 0.5}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "switch_at": ("FLOAT", {"default": 0.3, "min": 0.05, "max": 0.9, "step": 0.05}),
+                "mask_source": (["attn_maps", "attn_maps+silhouette", "x0_detect"],),
+                "map_threshold": ("FLOAT", {"default": 0.35, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "mask_feather": ("INT", {"default": 6, "min": 0, "max": 64}),
+                "base_bleed": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "self_attn_jail": ("BOOLEAN", {"default": True}),
+                "jail_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "subject_word": ("STRING", {"default": "girl"}),
+            },
+            "optional": {
+                "vae": ("VAE",),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "MASK", "IMAGE", "STRING")
+    RETURN_NAMES = ("latent", "char_masks", "mask_preview", "info")
+    FUNCTION = "run"
+    CATEGORY = "Unblend"
+
+    # ── helpers ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _encode(clip, text):
+        tokens = clip.tokenize(text or "")
+        if hasattr(clip, "encode_from_tokens_scheduled"):
+            return clip.encode_from_tokens_scheduled(tokens)
+        cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+        return [[cond, {"pooled_output": pooled}]]
+
+    @staticmethod
+    def _sample(model, noise, steps, cfg, sampler_name, scheduler, positive,
+                negative, latent, start_step, last_step, force_full_denoise,
+                disable_noise, seed, callback=None):
+        import comfy.sample
+        import comfy.utils
+        return comfy.sample.sample(
+            model, noise, steps, cfg, sampler_name, scheduler,
+            positive, negative, latent,
+            denoise=1.0, disable_noise=disable_noise,
+            start_step=start_step, last_step=last_step,
+            force_full_denoise=force_full_denoise,
+            noise_mask=None, callback=callback,
+            disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed)
+
+    @staticmethod
+    def _mask_preview(masks, background, scale=6):
+        palette = [(255, 80, 80), (80, 160, 255), (80, 255, 120), (255, 220, 80)]
+        n, H, W = masks.shape
+        canvas = np.zeros((H, W, 3), dtype=np.float32)
+        canvas[background.numpy() > 0.5] = (40, 40, 40)
+        for i in range(n):
+            m = masks[i].numpy()
+            for c in range(3):
+                canvas[..., c] += m * palette[i % 4][c]
+        canvas = np.clip(canvas, 0, 255) / 255.0
+        t = torch.from_numpy(canvas).permute(2, 0, 1).unsqueeze(0)
+        t = F.interpolate(t, scale_factor=scale, mode="nearest")
+        return t.permute(0, 2, 3, 1)
+
+    def _x0_masks(self, x0_image, n_chars, latent_h, latent_w):
+        """Маски из классического детекта (головы + силуэт, Вороной) по x0."""
+        import cv2
+        from PIL import Image
+        from .deepghs_nodes import detect_heads_backend, _dedup_boxes, silhouette_fg
+
+        img = (np.clip(x0_image[0].cpu().numpy(), 0, 1) * 255).astype(np.uint8)
+        pil = Image.fromarray(img, "RGB")
+        w, h = pil.size
+        fg = silhouette_fg(pil)
+        heads, _ = detect_heads_backend(pil, 0.3, 0.45, None)
+        heads, _ = _dedup_boxes(heads, [1.0] * len(heads), 0.05 * min(w, h))
+        heads = sorted(heads, key=lambda b: b[0])[:n_chars]  # слева направо
+        if len(heads) < 2:
+            return None, fg
+        centers = [((b[0] + b[2]) / 2, (b[1] + b[3]) / 2) for b in heads]
+        yy, xx = np.mgrid[0:h, 0:w]
+        owner = np.argmin(np.stack(
+            [(xx - cx) ** 2 + (yy - cy) ** 2 for cx, cy in centers]), axis=0)
+        masks = []
+        for i in range(len(centers)):
+            m = ((owner == i) & (fg > 0)).astype(np.float32)
+            m = cv2.resize(m, (latent_w, latent_h), interpolation=cv2.INTER_LINEAR)
+            masks.append(torch.from_numpy(m))
+        return torch.stack(masks), fg
+
+    # ── main ───────────────────────────────────────────────────────────────
+
+    def run(self, model, clip, latent_image, prompt, negative_prompt, seed,
+            steps, cfg, sampler_name, scheduler, switch_at, mask_source,
+            map_threshold, mask_feather, base_bleed, self_attn_jail,
+            jail_strength, subject_word, vae=None):
+        import comfy.sample
+
+        _check_sdxl(model)
+        info = []
+
+        latent = comfy.sample.fix_empty_latent_channels(
+            model, latent_image["samples"])
+        if latent.shape[0] != 1:
+            print("[UnblendBounded] batch>1 пока не поддержан, беру первый")
+            latent = latent[:1]
+        H, W = latent.shape[-2:]
+
+        # ── промпты ────────────────────────────────────────────────────────
+        sections = parse_prompt(prompt)
+        char_texts = [_clean(sections[f"char{i}"]) for i in range(1, 5)]
+        n_chars = sum(1 for c in char_texts if c)
+        if n_chars < 2:
+            raise ValueError("[UnblendBounded] нужно минимум 2 заполненных [CHARn]")
+        draw, base, regions = build_blocks(
+            prompt, subject_word=(subject_word.strip() or "girl"))
+
+        draw_cond = self._encode(clip, draw)
+        base_cond = self._encode(clip, base)
+        neg_cond = self._encode(clip, negative_prompt)
+        region_conds_full = [self._encode(clip, r) for r in regions if r]
+
+        # ── фаза 1: свободная генерация + сбор карт ────────────────────────
+        switch_step = max(1, min(steps - 1, round(steps * switch_at)))
+        info.append(f"персонажей: {n_chars}, switch на шаге {switch_step}/{steps}")
+
+        need_maps = mask_source.startswith("attn_maps")
+        harvester = None
+        m1 = model.clone()
+        if need_maps:
+            spans = find_char_spans(clip, draw, [c for c in char_texts if c])
+            missing = [i + 1 for i, s in spans.items() if not s]
+            if missing:
+                info.append(f"токены CHAR{missing} не найдены в draw — "
+                            f"эти регионы без масок")
+            harvester = _Harvester(spans)
+            patch = harvester.patch()
+            for name, count in (("input", 12), ("middle", 1), ("output", 12)):
+                for number in range(count):
+                    for t_idx in range(10):
+                        m1.set_model_attn2_replace(patch, name, number, t_idx)
+
+        x0_holder = {}
+
+        def grab_x0(step, x0, x, total_steps):
+            x0_holder["x0"] = x0
+
+        noise = comfy.sample.prepare_noise(latent, seed, None)
+        mid = self._sample(m1, noise, steps, cfg, sampler_name, scheduler,
+                           draw_cond, neg_cond, latent,
+                           start_step=0, last_step=switch_step,
+                           force_full_denoise=False, disable_noise=False,
+                           seed=seed, callback=grab_x0)
+
+        # ── маски ──────────────────────────────────────────────────────────
+        fg = None
+        x0_img = None
+        if vae is not None and "x0" in x0_holder and (
+                mask_source in ("attn_maps+silhouette", "x0_detect")):
+            x0_img = vae.decode(x0_holder["x0"])
+
+        masks = None
+        if mask_source == "x0_detect":
+            if x0_img is None:
+                raise ValueError("[UnblendBounded] x0_detect требует подключённый vae")
+            masks, _ = self._x0_masks(x0_img, n_chars, H, W)
+            if masks is None:
+                info.append("x0_detect: голов < 2 — фолбэк без couple")
+        else:
+            if not harvester or not harvester.acc:
+                info.append("attn-карты пусты — фолбэк без couple")
+            else:
+                if mask_source == "attn_maps+silhouette" and x0_img is not None:
+                    from PIL import Image
+                    from .deepghs_nodes import silhouette_fg
+                    img = (np.clip(x0_img[0].cpu().numpy(), 0, 1) * 255).astype(np.uint8)
+                    fg = silhouette_fg(Image.fromarray(img, "RGB"))
+                present = [i for i, c in enumerate(char_texts) if c]
+                maps, keep = [], []
+                for j, ci in enumerate(range(len(present))):
+                    if ci in harvester.acc:
+                        maps.append(harvester.acc[ci])
+                        keep.append(j)
+                masks_all, background, ok = build_masks_from_maps(
+                    maps, H, W, map_threshold=map_threshold, fg=fg)
+                good = [k for k, o in zip(keep, ok) if o]
+                if len(good) >= 2:
+                    masks = masks_all[[keep.index(g) for g in good]]
+                    region_conds_full = [region_conds_full[g] for g in good]
+                    areas = [f"{masks[i].mean() * 100:.1f}%" for i in range(len(good))]
+                    info.append(f"маски из attn-карт: {areas}")
+                else:
+                    info.append(f"карты слабые (порог {map_threshold}) — фолбэк без couple")
+                    masks = None
+
+        # ── фаза 2 ─────────────────────────────────────────────────────────
+        if masks is not None:
+            soft = feather_masks(masks, mask_feather)
+            background = (masks.sum(dim=0) < 0.5).float()
+            stack = torch.stack([background + base_bleed] + list(soft))
+            m2, _ = apply_couple(model, [c[0][0] for c in region_conds_full],
+                                 stack, masks, jail=self_attn_jail,
+                                 jail_strength=jail_strength)
+            positive2 = base_cond
+            info.append("фаза 2: couple" + (" + jail" if self_attn_jail else ""))
+        else:
+            m2, positive2 = model, draw_cond
+            masks = torch.zeros(1, H, W)
+            background = torch.ones(H, W)
+            info.append("фаза 2: без патчей (фолбэк)")
+
+        out = self._sample(m2, torch.zeros_like(noise), steps, cfg,
+                           sampler_name, scheduler, positive2, neg_cond, mid,
+                           start_step=switch_step, last_step=steps,
+                           force_full_denoise=True, disable_noise=True,
+                           seed=seed)
+
+        preview = self._mask_preview(masks, background)
+        return ({"samples": out}, masks, preview, " | ".join(info))
+
+
+NODE_CLASS_MAPPINGS = {
+    "UnblendCoupleApply": UnblendCoupleApply,
+    "UnblendBoundedSampler": UnblendBoundedSampler,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "UnblendCoupleApply": "Unblend Couple Apply (SDXL + jail)",
+    "UnblendBoundedSampler": "Unblend Bounded Sampler (1-pass)",
+}

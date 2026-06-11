@@ -52,6 +52,17 @@ try:
 except Exception as e:
     print(f"[Unblend] unblend_attention не загрузился: {e}")
 
+# --- bounded sampler + couple/jail ядро (SDXL) ---
+try:
+    from .auto_couple import (
+        NODE_CLASS_MAPPINGS as _ac_map,
+        NODE_DISPLAY_NAME_MAPPINGS as _ac_disp,
+    )
+    NODE_CLASS_MAPPINGS.update(_ac_map)
+    NODE_DISPLAY_NAME_MAPPINGS.update(_ac_disp)
+except Exception as e:
+    print(f"[Unblend] auto_couple не загрузился: {e}")
+
 try:
     from .counter_nodes import (
         NODE_CLASS_MAPPINGS as _cnt_map,
