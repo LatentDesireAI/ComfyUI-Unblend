@@ -670,6 +670,11 @@ class UnblendBoundedSampler:
                 "self_attn_jail": ("BOOLEAN", {"default": True}),
                 "jail_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "subject_word": ("STRING", {"default": "girl"}),
+                # 0 = продолжить траекторию фазы 1 (мягко, но смешанное в
+                # фазе 1 уже не перекрасить). >0 = рестарт с x0 + свежий шум:
+                # как denoise у img2img — больше силы исправить одежду/черты,
+                # композиция держится x0+масками. Рекомендуется 0.5-0.7.
+                "repaint_denoise": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 0.95, "step": 0.05}),
             },
             "optional": {
                 "vae": ("VAE",),
@@ -694,13 +699,13 @@ class UnblendBoundedSampler:
     @staticmethod
     def _sample(model, noise, steps, cfg, sampler_name, scheduler, positive,
                 negative, latent, start_step, last_step, force_full_denoise,
-                disable_noise, seed, callback=None):
+                disable_noise, seed, callback=None, denoise=1.0):
         import comfy.sample
         import comfy.utils
         return comfy.sample.sample(
             model, noise, steps, cfg, sampler_name, scheduler,
             positive, negative, latent,
-            denoise=1.0, disable_noise=disable_noise,
+            denoise=denoise, disable_noise=disable_noise,
             start_step=start_step, last_step=last_step,
             force_full_denoise=force_full_denoise,
             noise_mask=None, callback=callback,
@@ -776,7 +781,7 @@ class UnblendBoundedSampler:
     def run(self, model, clip, latent_image, prompt, negative_prompt, seed,
             steps, cfg, sampler_name, scheduler, switch_at, mask_source,
             map_threshold, mask_feather, base_bleed, self_attn_jail,
-            jail_strength, subject_word, vae=None):
+            jail_strength, subject_word, repaint_denoise=0.6, vae=None):
         import comfy.sample
 
         _check_sdxl(model)
@@ -918,11 +923,27 @@ class UnblendBoundedSampler:
             else:
                 preview = self._mask_preview(masks, background)
 
-        out = self._sample(m2, torch.zeros_like(noise), steps, cfg,
-                           sampler_name, scheduler, positive2, neg_cond, mid,
-                           start_step=switch_step, last_step=steps,
-                           force_full_denoise=True, disable_noise=True,
-                           seed=seed)
+        if masks.sum() > 0 and repaint_denoise > 0 and "x0" in x0_holder:
+            # рестарт с x0-предсказания + свежий шум: у фазы 2 появляется
+            # сила перекрасить то, что фаза 1 успела смешать (аналог
+            # denoise 0.9 в двухпроходном пайплайне)
+            base_latent = x0_holder["x0"].to(mid.device, dtype=mid.dtype)
+            remaining = max(8, steps - switch_step)
+            noise2 = comfy.sample.prepare_noise(base_latent, seed, None)
+            out = self._sample(m2, noise2, remaining, cfg, sampler_name,
+                               scheduler, positive2, neg_cond, base_latent,
+                               start_step=None, last_step=None,
+                               force_full_denoise=True, disable_noise=False,
+                               seed=seed, denoise=float(repaint_denoise))
+            info.append(f"repaint c x0: denoise {repaint_denoise}, {remaining} шагов")
+        else:
+            out = self._sample(m2, torch.zeros_like(noise), steps, cfg,
+                               sampler_name, scheduler, positive2, neg_cond, mid,
+                               start_step=switch_step, last_step=steps,
+                               force_full_denoise=True, disable_noise=True,
+                               seed=seed)
+            if repaint_denoise > 0 and masks.sum() == 0:
+                info.append("repaint пропущен (нет масок)")
 
         info_str = " | ".join(info)
         print(f"[UnblendBounded] {info_str}")
