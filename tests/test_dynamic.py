@@ -118,6 +118,48 @@ bias2 = st.cross_bias(SEQ, SEQ_K, "cpu", torch.float32)
 check("кеш инвалидирован", st.mask_version == old_ver + 1
       and bias2[left_px, 5] == -10000.0)
 
+# ── харвест свободный, не задушенный bias (анти-спираль) ──────────────────
+st.pending = {}
+q0 = torch.zeros(2, SEQ, HID)
+k0 = torch.zeros(2, SEQ_K, HID)
+v0 = torch.zeros(2, SEQ_K, HID)
+rep2(q0, k0, v0, extra)  # маски стоят, bias активен
+pend0 = st.pending[0][0]
+check("харвест без bias: нет нулевых дыр", float(pend0.min()) > 0,
+      f"min={float(pend0.min()):.2e}")
+import numpy as _np
+flat_p = pend0.flatten()
+check("харвест без bias: равномерный при q=0",
+      float(_np.std(flat_p)) < 1e-6, f"std={float(_np.std(flat_p)):.2e}")
+
+# ── head_char_affinity: личность головы по картам ──────────────────────────
+lat_h, lat_w = 26, 38
+img_w, img_h = 380, 260
+map_left = _np.zeros((lat_h, lat_w), _np.float32)
+map_left[2:8, 5:12] = 1.0     # горит на левой голове
+map_right = _np.zeros((lat_h, lat_w), _np.float32)
+map_right[2:8, 26:33] = 1.0   # горит на правой
+head_l = [55, 18, 122, 82]    # коорд. изображения (x0,y0,x1,y1)
+head_r = [258, 18, 325, 82]
+aff = ac.head_char_affinity({0: map_left, 1: map_right},
+                            [head_l, head_r], lat_h, lat_w, img_w, img_h)
+check("affinity прямой порядок", aff == {0: 0, 1: 1}, str(aff))
+aff2 = ac.head_char_affinity({0: map_right, 1: map_left},
+                             [head_l, head_r], lat_h, lat_w, img_w, img_h)
+check("affinity перestановка", aff2 == {0: 1, 1: 0}, str(aff2))
+
+# ── voronoi_char_masks ─────────────────────────────────────────────────────
+fg_img = _np.zeros((260, 380), _np.float32)
+fg_img[30:250, 40:340] = 1.0
+vm = ac.voronoi_char_masks(fg_img, [head_l, head_r], 104, 152)
+check("voronoi форма", vm.shape == (2, 104, 152), str(vm.shape))
+check("voronoi без пересечений", float((vm[0] * vm[1]).sum()) == 0.0)
+check("voronoi лево/право", float(vm[0][:, :60].sum()) > 0
+      and float(vm[1][:, 90:].sum()) > 0)
+areas = [float(vm[i].mean()) for i in range(2)]
+ratio = max(areas) / max(min(areas), 1e-9)
+check("voronoi сбалансирован", ratio < 1.5, f"ratio={ratio:.2f}")
+
 print()
 print("ИТОГ:", "все тесты прошли" if not fails else f"ПРОВАЛЕНО: {fails}")
 sys.exit(1 if fails else 0)

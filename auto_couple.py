@@ -1066,6 +1066,59 @@ class _DynamicState:
         return self._jail_cache[key]
 
 
+def head_char_affinity(ema_maps, head_boxes, latent_h, latent_w, img_w, img_h):
+    """Кому принадлежит каждая голова: {char_idx: head_idx} (греди по картам).
+
+    Геометрию масок даёт детект (головы+силуэт, сбалансировано по построению),
+    а attn-карты используются только для ОПОЗНАНИЯ — карта персонажа горит
+    на его лице/волосах. Это разрывает петлю «маска формирует карту».
+    """
+    sx = latent_w / float(img_w)
+    sy = latent_h / float(img_h)
+    scores = []
+    for ci, m in ema_maps.items():
+        t = torch.as_tensor(m, dtype=torch.float32)
+        t = F.interpolate(t.view(1, 1, *t.shape), size=(latent_h, latent_w),
+                          mode="bilinear", align_corners=False)[0, 0]
+        mx = float(t.max())
+        if mx > 0:
+            t = t / mx
+        for hi, (x0, y0, x1, y1) in enumerate(head_boxes):
+            a = max(0, int(y0 * sy)); b = min(latent_h, int(y1 * sy) + 1)
+            c = max(0, int(x0 * sx)); d = min(latent_w, int(x1 * sx) + 1)
+            region = t[a:b, c:d]
+            if region.numel():
+                scores.append((float(region.mean()), ci, hi))
+    scores.sort(reverse=True)
+    used_c, used_h, out = set(), set(), {}
+    for s, ci, hi in scores:
+        if ci in used_c or hi in used_h:
+            continue
+        out[ci] = hi
+        used_c.add(ci)
+        used_h.add(hi)
+    return out
+
+
+def voronoi_char_masks(fg, head_boxes, latent_h, latent_w):
+    """Силуэт + центры голов -> (n, H, W) маски (Вороной внутри силуэта)."""
+    import cv2
+    fg_np = np.asarray(fg).astype(np.float32)
+    if fg_np.ndim == 3:
+        fg_np = fg_np[..., 0]
+    h, w = fg_np.shape
+    centers = [((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) for b in head_boxes]
+    yy, xx = np.mgrid[0:h, 0:w]
+    owner = np.argmin(np.stack(
+        [(xx - cx) ** 2 + (yy - cy) ** 2 for cx, cy in centers]), axis=0)
+    masks = []
+    for i in range(len(centers)):
+        m = ((owner == i) & (fg_np > 0.5)).astype(np.float32)
+        m = cv2.resize(m, (latent_w, latent_h), interpolation=cv2.INTER_LINEAR)
+        masks.append(torch.from_numpy((m > 0.5).astype(np.float32)))
+    return torch.stack(masks)
+
+
 def _dyn_attn2_replace(state):
     """Attention с bias по маскам + харвест карт. Заменяет attn2."""
 
@@ -1091,15 +1144,18 @@ def _dyn_attn2_replace(state):
                 bias = state.cross_bias(seq_q, seq_k, q.device, q.dtype)
             if (flag == 0 and seq_q <= state.harvest_max_seq and state.spans):
                 scores = qh @ kh.transpose(-1, -2) * scale
-                if bias is not None:
-                    scores = scores + bias
-                probs = scores.softmax(dim=-1)
+                # харвест ВСЕГДА по свободному вниманию (без bias) — иначе
+                # маски самоподкрепляются: задушенный токен не светится вне
+                # своей маски, маска сжимается каждый refresh до нуля
+                probs_free = scores.softmax(dim=-1)
                 try:
-                    state.harvest(probs.mean(dim=1), seq_q)
+                    state.harvest(probs_free.mean(dim=1), seq_q)
                 except Exception as e:
                     if not getattr(state, "_warned", False):
                         print(f"[UnblendDynamic] harvest error: {e}")
                         state._warned = True
+                probs = ((scores + bias).softmax(dim=-1)
+                         if bias is not None else probs_free)
                 o = probs @ vh
             else:
                 o = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=bias)
@@ -1230,17 +1286,47 @@ class UnblendDynamicSampler:
         if mask_source == "attn_maps+silhouette" and vae is None:
             info.append("vae не подключён — силуэт выключен")
 
+        state.last_mode = "—"
+
         def refresh_masks(x0):
             fg = None
+            pil = None
             if use_sil:
                 try:
                     from PIL import Image
                     from .deepghs_nodes import silhouette_fg
                     img_t = vae.decode(x0)
                     img = (np.clip(img_t[0].cpu().numpy(), 0, 1) * 255).astype(np.uint8)
-                    fg = silhouette_fg(Image.fromarray(img, "RGB"))
+                    pil = Image.fromarray(img, "RGB")
+                    fg = silhouette_fg(pil)
                 except Exception as e:
                     print(f"[UnblendDynamic] силуэт не получился: {e}")
+
+            # ── приоритет: геометрия от голов, личность от карт ────────────
+            # Детект голов даёт сбалансированные зоны по построению (никто
+            # не «доминирует»), attn-карты лишь опознают, какая голова чья.
+            if pil is not None and fg is not None and state.ema:
+                try:
+                    from .deepghs_nodes import detect_heads_backend, _dedup_boxes
+                    heads, hconf = detect_heads_backend(pil, 0.3, 0.45, None)
+                    heads, hconf = _dedup_boxes(
+                        heads, hconf, 0.05 * min(pil.size))
+                    if len(heads) >= 2:
+                        assign = head_char_affinity(
+                            state.ema, heads, H, W, pil.width, pil.height)
+                        if len(assign) >= 2:
+                            order = sorted(assign)
+                            vmasks = voronoi_char_masks(
+                                fg, [heads[assign[ci]] for ci in order], H, W)
+                            state.set_masks(
+                                vmasks, {ci: r for r, ci in enumerate(order)})
+                            state.last_mode = "heads+attn-id"
+                            return
+                except Exception as e:
+                    print(f"[UnblendDynamic] heads-режим не сработал ({e}), "
+                          f"откат на attn-конкуренцию")
+
+            state.last_mode = "attn-only"
             keys = sorted(state.ema.keys())
             maps = [state.ema[k] for k in keys]
             if len(maps) < 2:
@@ -1277,7 +1363,8 @@ class UnblendDynamicSampler:
             masks = state.masks
             background = (masks.sum(dim=0) < 0.5).float()
             areas = [f"{masks[i].mean() * 100:.1f}%" for i in range(masks.shape[0])]
-            info.append(f"refresh'ей: {state.refresh_count}, маски: {areas}")
+            info.append(f"refresh'ей: {state.refresh_count} ({state.last_mode}), "
+                        f"маски: {areas}")
             preview = UnblendBoundedSampler._mask_preview(masks, background)
         else:
             masks = torch.zeros(1, H, W)
