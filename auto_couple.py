@@ -1473,8 +1473,17 @@ class UnblendDynamicSampler:
             },
         }
 
-    RETURN_TYPES = ("LATENT", "MASK", "IMAGE", "STRING")
-    RETURN_NAMES = ("latent", "char_masks", "mask_preview", "info")
+    RETURN_TYPES = ("LATENT", "MASK", "IMAGE", "STRING",
+                    "MODEL", "CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("latent", "char_masks", "mask_preview", "info",
+                    "model", "positive", "negative")
+    OUTPUT_TOOLTIPS = (
+        "латент результата", "маски персонажей", "превью масок", "лог",
+        "пропатченная модель (couple+jail с финальными масками) — для "
+        "детейл/hires KSampler'а; маски сами пересчитаются под новый размер",
+        "draw-кондишен (ОБЯЗАТЕЛЕН как positive второго KSampler'а — bias "
+        "привязан к позициям его токенов)",
+        "негатив (для удобства)")
     FUNCTION = "run"
     CATEGORY = "Unblend"
 
@@ -1718,7 +1727,8 @@ class UnblendDynamicSampler:
 
         info_str = " | ".join(info)
         print(f"[UnblendDynamic] {info_str}")
-        return ({"samples": out}, masks, preview, info_str)
+        return ({"samples": out}, masks, preview, info_str,
+                m, draw_cond, neg_cond)
 
     @staticmethod
     def _run_sample(model, noise, steps, cfg, sampler_name, scheduler,
