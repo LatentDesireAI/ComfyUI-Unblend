@@ -175,6 +175,38 @@ st_empty = ac._DynamicState({0: [5], 1: [10]}, 4, 2, 0.35, 1.0, 1.0, 4096)
 rm3 = ac._stabilize_identity(st_empty, new_masks, {0: 0, 1: 1})
 check("identity: без прежних масок без изменений", rm3 == {0: 0, 1: 1}, str(rm3))
 
+# ── мягкие маски: подталкивание (-4) вместо стены, jail выключен ───────────
+st_soft = ac._DynamicState({0: [5, 6], 1: [10, 11]}, 4, 2, 0.35, 1.0, 1.0, 4096)
+st_soft.latent_hw = (H, W)
+st_soft.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1}, soft=True)
+bs = st_soft.cross_bias(SEQ, SEQ_K, "cpu", torch.float32)
+check("soft: bias = -4 (не стена)", float(bs[right_px, 5]) == -4.0,
+      str(float(bs[right_px, 5])))
+check("soft: jail выключен",
+      st_soft.jail_bias_for_seq(SEQ, "cpu", torch.float32) is None)
+st_soft.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1}, soft=False)
+check("hard: jail включается",
+      st_soft.jail_bias_for_seq(SEQ, "cpu", torch.float32) is not None)
+
+# ── straight_divider_masks: прямая линия между пиками ──────────────────────
+sd = ac.straight_divider_masks([(30.0, 52.0), (120.0, 52.0)], 104, 152)
+check("line: форма", sd.shape == (2, 104, 152))
+check("line: вертикальная граница", float(sd[0][:, :70].mean()) == 1.0
+      and float(sd[1][:, 80:].mean()) == 1.0)
+check("line: полное покрытие", float((sd.sum(0) - 1).abs().max()) == 0.0)
+sd2 = ac.straight_divider_masks([(76.0, 20.0), (76.0, 84.0)], 104, 152)
+check("line: горизонтальная граница", float(sd2[0][:45, :].mean()) == 1.0
+      and float(sd2[1][60:, :].mean()) == 1.0)
+
+# ── ema_peaks_latent ───────────────────────────────────────────────────────
+pm = {0: _np.zeros((26, 38), _np.float32), 1: _np.zeros((26, 38), _np.float32)}
+pm[0][6, 9] = 1.0   # пик слева-сверху
+pm[1][20, 30] = 1.0
+pk = ac.ema_peaks_latent(pm, [0, 1], 104, 152)
+check("peaks: масштаб", abs(pk[0][0] - 38.0) < 2.5 and abs(pk[0][1] - 26.0) < 2.5
+      and abs(pk[1][0] - 122.0) < 2.5 and abs(pk[1][1] - 82.0) < 2.5,
+      str([(f'{x:.0f}', f'{y:.0f}') for x, y in pk]))
+
 # ── watershed_char_masks: граница по краю картинки ─────────────────────────
 from PIL import Image as _Image
 img_arr = _np.zeros((260, 380, 3), _np.uint8)

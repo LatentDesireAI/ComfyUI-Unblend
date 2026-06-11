@@ -1061,6 +1061,8 @@ class _DynamicState:
 
         self.latent_hw = None
         self.masks = None        # (rows, H, W) жёсткие
+        self.masks_soft = False  # True = мягкое подталкивание (init/линия),
+                                 # False = стена (контуры тел) + jail
         self.char_rows = {}      # char_idx -> строка в masks
         self.mask_version = 0
         self.ema = {}            # char_idx -> np (h, w)
@@ -1102,8 +1104,9 @@ class _DynamicState:
                 self.ema[ci] = new
         self.pending = {}
 
-    def set_masks(self, masks, char_rows):
+    def set_masks(self, masks, char_rows, soft=False):
         self.masks = masks
+        self.masks_soft = soft
         self.char_rows = char_rows
         self.mask_version += 1
         self._cross_cache.clear()
@@ -1122,7 +1125,9 @@ class _DynamicState:
                               mode="bilinear", align_corners=False)
             m = m.squeeze(1).reshape(self.masks.shape[0], -1)[:, :seq_q]
             bias = torch.zeros(seq_q, seq_k, dtype=torch.float32)
-            val = -10000.0 * float(self.bound_strength)
+            # мягкие маски (init-зоны, линия по пикам) — подталкивание (-4),
+            # тела могут пересекать границу. Жёсткие (контуры тел) — стена.
+            val = (-4.0 if self.masks_soft else -10000.0) * float(self.bound_strength)
             for ci, row in self.char_rows.items():
                 span = [p for p in (self.spans.get(ci) or []) if p < seq_k]
                 if not span:
@@ -1134,7 +1139,9 @@ class _DynamicState:
         return self._cross_cache[key]
 
     def jail_bias_for_seq(self, seq_len, device, dtype):
-        if self.masks is None or self.jail_strength <= 0:
+        # jail только с контурами тел: резать self-attn по прямой линии
+        # сквозь пересекающиеся тела = разорванная анатомия («монстры»)
+        if self.masks is None or self.jail_strength <= 0 or self.masks_soft:
             return None
         key = (seq_len, self.mask_version, str(device), dtype)
         if key not in self._jail_cache:
@@ -1238,6 +1245,31 @@ def watershed_char_masks(pil, fg, head_boxes, latent_h, latent_w):
         m = cv2.resize(m, (latent_w, latent_h), interpolation=cv2.INTER_LINEAR)
         masks.append(torch.from_numpy((m > 0.5).astype(np.float32)))
     return torch.stack(masks)
+
+
+def straight_divider_masks(centers, latent_h, latent_w):
+    """Прямая линия посередине между двумя точками -> 2 зоны на весь кадр.
+
+    «Заранее знать, где будут персонажи»: пики attn-карт дают положение
+    каждого уже на 3-5 шаге. Перпендикуляр посередине между пиками —
+    честная граница, которая едет за персонажами по мере генерации.
+    """
+    (ax, ay), (bx, by) = centers
+    yy, xx = np.mgrid[0:latent_h, 0:latent_w]
+    side = (xx - (ax + bx) / 2.0) * (bx - ax) + (yy - (ay + by) / 2.0) * (by - ay)
+    m0 = torch.from_numpy((side <= 0).astype(np.float32))
+    return torch.stack([m0, 1.0 - m0])
+
+
+def ema_peaks_latent(ema, keys, latent_h, latent_w):
+    """Пики карт (где формируется каждый персонаж) в координатах латента."""
+    peaks = []
+    for k in keys:
+        m = ema[k]
+        h, w = m.shape
+        py, px = np.unravel_index(int(np.argmax(m)), (h, w))
+        peaks.append(((px + 0.5) * latent_w / w, (py + 0.5) * latent_h / h))
+    return peaks
 
 
 def _stabilize_identity(state, new_masks, rows_map):
@@ -1451,9 +1483,10 @@ class UnblendDynamicSampler:
                 for i in range(len(present)):
                     zmask[i, :, edges[i]:edges[i + 1]] = 1.0
                 state.latent_hw = (H, W)
-                state.set_masks(zmask, {i: i for i in range(len(present))})
-                state.last_mode = "init-zones"
-                info.append(f"старт: зоны {init} с шага 0 (CHAR1 слева)")
+                state.set_masks(zmask, {i: i for i in range(len(present))},
+                                soft=True)
+                state.last_mode = "init-zones (soft)"
+                info.append(f"старт: мягкие зоны {init} с шага 0 (CHAR1 слева)")
             except Exception as e:
                 info.append(f"init_ratios «{init_ratios}» не разобрал: {e}")
 
@@ -1539,11 +1572,32 @@ class UnblendDynamicSampler:
                 _log(done, f"без силуэта (pil={pil is not None}, "
                            f"ema={len(state.ema)}) -> attn-only")
 
-            state.last_mode = "attn-only"
             keys = sorted(state.ema.keys())
-            maps = [state.ema[k] for k in keys]
-            if len(maps) < 2:
+            if len(keys) < 2:
                 return
+
+            # ── 2 персонажа: «прямая линия между ними» по пикам карт ───────
+            # Пики надёжны рано (положение), контуры — нет. Мягкая зона
+            # по перпендикуляру между пиками, едет за персонажами.
+            if len(keys) == 2:
+                peaks = ema_peaks_latent(state.ema, keys, H, W)
+                (ax, ay), (bx, by) = peaks
+                dist = math.hypot(bx - ax, by - ay) / math.hypot(H, W)
+                if dist < 0.10:
+                    _log(done, f"пики слиплись (dist={dist:.2f}) — без обновления")
+                    return
+                lmasks = straight_divider_masks(peaks, H, W)
+                rows_map = _stabilize_identity(
+                    state, lmasks, {keys[0]: 0, keys[1]: 1})
+                state.set_masks(lmasks, rows_map, soft=True)
+                state.last_mode = "peak-line (soft)"
+                _log(done, f"линия по пикам ({ax:.0f},{ay:.0f})-({bx:.0f},{by:.0f}), "
+                           f"мягкие зоны")
+                return
+
+            # ── 3+ персонажа: старая конкуренция карт ──────────────────────
+            state.last_mode = "attn-only"
+            maps = [state.ema[k] for k in keys]
             thr = float(map_threshold)
             while True:
                 masks_all, _, ok = build_masks_from_maps(
@@ -1559,15 +1613,14 @@ class UnblendDynamicSampler:
             masks_sel = masks_all[rows]
             if fg is not None:
                 masks_sel = fill_silhouette(masks_sel, fg)
-            # страховка от доминирования: перекошенные attn-маски вреднее,
-            # чем отсутствие масок (bias зацементирует перекос)
             fr = [float(masks_sel[i].mean()) for i in range(masks_sel.shape[0])]
             if min(fr) < 0.05 or max(fr) / max(min(fr), 1e-9) > 4.0:
                 _log(done, f"attn-only: дисбаланс {[f'{a*100:.0f}%' for a in fr]}"
                            f" — маски не обновлены")
                 return
-            state.set_masks(masks_sel, {g: r for r, g in enumerate(good)})
-            _log(done, f"attn-only, маски {[f'{a*100:.0f}%' for a in fr]}")
+            state.set_masks(masks_sel, {g: r for r, g in enumerate(good)},
+                            soft=True)
+            _log(done, f"attn-only (soft), маски {[f'{a*100:.0f}%' for a in fr]}")
 
         def cb(step, x0, x, total_steps):
             state.finalize_step()
