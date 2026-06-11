@@ -1376,6 +1376,10 @@ class UnblendDynamicSampler:
                 # watershed: граница зон по краям картинки (одежда/кожа) —
                 # для объятий/поцелуев. nearest_center: чистый Вороной.
                 "divider": (["watershed", "nearest_center"],),
+                # стартовые зоны С ШАГА 0 (как Matrix у Regional Prompter):
+                # "1,1" = колонки пополам (CHAR1 слева), "" = выкл.
+                # Детект позже заменит их реальными контурами тел.
+                "init_ratios": ("STRING", {"default": "1,1"}),
             },
             "optional": {
                 "vae": ("VAE",),
@@ -1390,7 +1394,8 @@ class UnblendDynamicSampler:
     def run(self, model, clip, latent_image, prompt, negative_prompt, seed,
             steps, cfg, sampler_name, scheduler, warmup_at, refresh_every,
             mask_source, map_threshold, bound_strength, self_attn_jail,
-            jail_strength, subject_word, divider="watershed", vae=None):
+            jail_strength, subject_word, divider="watershed",
+            init_ratios="1,1", vae=None):
         import comfy.sample
 
         _check_sdxl(model)
@@ -1423,6 +1428,34 @@ class UnblendDynamicSampler:
             bound_strength, jail_strength, jail_max_seq=4096)
         info.append(f"персонажей: {len(present)}, warmup {warmup_steps}/{steps}, "
                     f"refresh каждые {refresh_every}")
+
+        # ── стартовые зоны с шага 0 (Matrix-режим как у Regional Prompter) ──
+        # Ранние шаги решают композицию и цвета одежды — детект в это время
+        # слеп (силуэт/головы появляются к ~50-65% шагов). Жёсткие колонки
+        # защищают критичную фазу; refresh позже заменит их контурами тел.
+        init = (init_ratios or "").strip().lower()
+        if init and init not in ("none", "off", "0"):
+            try:
+                rs = [float(x) for x in init.replace(";", ",").split(",")
+                      if x.strip()]
+                rs = [r for r in rs if r > 0][:len(present)]
+                while len(rs) < len(present):
+                    rs.append(rs[-1] if rs else 1.0)
+                total = sum(rs)
+                edges, acc = [0], 0.0
+                for r in rs:
+                    acc += r / total
+                    edges.append(int(round(acc * W)))
+                edges[-1] = W
+                zmask = torch.zeros(len(present), H, W)
+                for i in range(len(present)):
+                    zmask[i, :, edges[i]:edges[i + 1]] = 1.0
+                state.latent_hw = (H, W)
+                state.set_masks(zmask, {i: i for i in range(len(present))})
+                state.last_mode = "init-zones"
+                info.append(f"старт: зоны {init} с шага 0 (CHAR1 слева)")
+            except Exception as e:
+                info.append(f"init_ratios «{init_ratios}» не разобрал: {e}")
 
         m = model.clone()
         patch2 = _dyn_attn2_replace(state)
