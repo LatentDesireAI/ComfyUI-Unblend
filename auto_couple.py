@@ -627,6 +627,20 @@ class UnblendCoupleApply:
         return (m,)
 
 
+def _x0_to_storage(model_patcher, x0):
+    """x0 из callback'а сэмплера -> storage-пространство латентов.
+
+    Внутри сэмплинга латенты отмасштабированы latent_format'ом (SDXL: ×0.13),
+    а vae.decode ждёт storage-масштаб (как в {'samples': ...}). Декод сырого
+    callback-x0 даёт серую малоконтрастную кашу: детект голов слепнет,
+    repaint выцветает.
+    """
+    try:
+        return model_patcher.model.process_latent_out(x0)
+    except Exception:
+        return x0
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Нода 2: UnblendBoundedSampler (одно-проходный комбайн)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -848,7 +862,7 @@ class UnblendBoundedSampler:
         x0_img = None
         if vae is not None and "x0" in x0_holder and (
                 mask_source in ("attn_maps+silhouette", "x0_detect")):
-            x0_img = vae.decode(x0_holder["x0"])
+            x0_img = vae.decode(_x0_to_storage(model, x0_holder["x0"]))
 
         masks = None
         if mask_source == "x0_detect":
@@ -927,7 +941,8 @@ class UnblendBoundedSampler:
             # рестарт с x0-предсказания + свежий шум: у фазы 2 появляется
             # сила перекрасить то, что фаза 1 успела смешать (аналог
             # denoise 0.9 в двухпроходном пайплайне)
-            base_latent = x0_holder["x0"].to(mid.device, dtype=mid.dtype)
+            base_latent = _x0_to_storage(model, x0_holder["x0"]).to(
+                mid.device, dtype=mid.dtype)
             remaining = max(8, steps - switch_step)
             noise2 = comfy.sample.prepare_noise(base_latent, seed, None)
             out = self._sample(m2, noise2, remaining, cfg, sampler_name,
@@ -1298,7 +1313,7 @@ class UnblendDynamicSampler:
                 try:
                     from PIL import Image
                     from .deepghs_nodes import silhouette_fg
-                    img_t = vae.decode(x0)
+                    img_t = vae.decode(_x0_to_storage(model, x0))
                     img = (np.clip(img_t[0].cpu().numpy(), 0, 1) * 255).astype(np.uint8)
                     pil = Image.fromarray(img, "RGB")
                     fg = silhouette_fg(pil)
