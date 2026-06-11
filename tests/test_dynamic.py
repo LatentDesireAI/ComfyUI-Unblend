@@ -175,6 +175,17 @@ st_empty = ac._DynamicState({0: [5], 1: [10]}, 4, 2, 0.35, 1.0, 1.0, 4096)
 rm3 = ac._stabilize_identity(st_empty, new_masks, {0: 0, 1: 1})
 check("identity: без прежних масок без изменений", rm3 == {0: 0, 1: 1}, str(rm3))
 
+# ── bias_spans ≠ harvest spans: полный чанк заперт, харвест узкий ──────────
+st_b = ac._DynamicState({0: [5], 1: [10]}, 4, 2, 0.35, 1.0, 1.0, 4096,
+                        bias_spans={0: [5, 6, 7], 1: [10, 11]})
+st_b.latent_hw = (H, W)
+st_b.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1})
+bb = st_b.cross_bias(SEQ, SEQ_K, "cpu", torch.float32)
+check("bias_spans: общий токен (7) тоже заперт", bb[right_px, 7] == -10000.0,
+      str(float(bb[right_px, 7])))
+check("bias_spans: харвест остался узким",
+      st_b.spans[0] == [5] and st_b.bias_spans[0] == [5, 6, 7])
+
 # ── мягкие маски: подталкивание (-4) вместо стены, jail выключен ───────────
 st_soft = ac._DynamicState({0: [5, 6], 1: [10, 11]}, 4, 2, 0.35, 1.0, 1.0, 4096)
 st_soft.latent_hw = (H, W)

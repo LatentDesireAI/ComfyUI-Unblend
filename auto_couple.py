@@ -541,7 +541,15 @@ def distinctive_positions(spans, needles):
 
 
 def find_char_spans(clip, draw_text, char_texts):
-    """Позиции токенов каждого CHARn внутри токенизированного draw-промпта."""
+    """Позиции токенов каждого CHARn внутри токенизированного draw-промпта.
+
+    Возвращает (full, distinctive):
+      full        — ВСЕ позиции чанка персонажа (для bias: «black» из чанка
+                    CHAR1 и «black» из чанка CHAR2 — разные позиции, каждая
+                    запирается в свою зону; фраза «white dress» неразрывна).
+      distinctive — без токенов, общих у нескольких персонажей (для харвеста
+                    карт: общие слова светятся на обеих фигурах и шумят).
+    """
     toks = clip.tokenize(draw_text)
     key = "g" if "g" in toks else ("l" if "l" in toks else next(iter(toks)))
     hay = flatten_token_ids(toks[key])
@@ -553,7 +561,7 @@ def find_char_spans(clip, draw_text, char_texts):
         sub = clip.tokenize(ct)
         needles[i] = strip_specials(flatten_token_ids(sub[key]))
         spans[i] = find_subsequence(hay, needles[i])
-    return distinctive_positions(spans, needles)
+    return spans, distinctive_positions(spans, needles)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -830,7 +838,7 @@ class UnblendBoundedSampler:
         harvester = None
         m1 = model.clone()
         if need_maps:
-            spans = find_char_spans(clip, draw, [c for c in char_texts if c])
+            _, spans = find_char_spans(clip, draw, [c for c in char_texts if c])
             missing = [i + 1 for i, s in spans.items() if not s]
             if missing:
                 info.append(f"токены CHAR{missing} не найдены в draw — "
@@ -1048,8 +1056,11 @@ class _DynamicState:
 
     def __init__(self, spans, refresh_every, warmup_steps, map_threshold,
                  bound_strength, jail_strength, jail_max_seq,
-                 harvest_max_seq=1100, ema_keep=0.6):
+                 harvest_max_seq=1100, ema_keep=0.6, bias_spans=None):
+        # spans — различительные токены (харвест карт);
+        # bias_spans — ПОЛНЫЕ позиции чанков (ограничение внимания)
         self.spans = {i: s for i, s in spans.items() if s}
+        self.bias_spans = {i: s for i, s in (bias_spans or spans).items() if s}
         self.refresh_every = max(1, refresh_every)
         self.warmup_steps = warmup_steps
         self.map_threshold = map_threshold
@@ -1129,7 +1140,7 @@ class _DynamicState:
             # тела могут пересекать границу. Жёсткие (контуры тел) — стена.
             val = (-4.0 if self.masks_soft else -10000.0) * float(self.bound_strength)
             for ci, row in self.char_rows.items():
-                span = [p for p in (self.spans.get(ci) or []) if p < seq_k]
+                span = [p for p in (self.bias_spans.get(ci) or []) if p < seq_k]
                 if not span:
                     continue
                 outside = m[row] < 0.5            # (seq_q,)
@@ -1493,15 +1504,16 @@ class UnblendDynamicSampler:
 
         draw_cond = UnblendBoundedSampler._encode(clip, draw)
         neg_cond = UnblendBoundedSampler._encode(clip, negative_prompt)
-        spans = find_char_spans(clip, draw, present)
-        missing = [i + 1 for i, s in spans.items() if not s]
+        bias_spans, spans = find_char_spans(clip, draw, present)
+        missing = [i + 1 for i, s in bias_spans.items() if not s]
         if missing:
             info.append(f"токены CHAR{missing} не найдены — без ограничений для них")
 
         warmup_steps = max(2, round(steps * warmup_at))
         state = _DynamicState(
             spans, refresh_every, warmup_steps, map_threshold,
-            bound_strength, jail_strength, jail_max_seq=4096)
+            bound_strength, jail_strength, jail_max_seq=4096,
+            bias_spans=bias_spans)
         info.append(f"персонажей: {len(present)}, warmup {warmup_steps}/{steps}, "
                     f"refresh каждые {refresh_every}")
 
