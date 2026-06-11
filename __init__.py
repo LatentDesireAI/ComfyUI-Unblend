@@ -13,33 +13,11 @@ ComfyUI-Unblend
 не мешает остальным нодам появиться.
 """
 
-# ── фикс onnxruntime-gpu под torch cu13x ──────────────────────────────────────
-# torch cu130 несёт только CUDA 13 DLL, а onnxruntime-gpu собран под CUDA 12 —
-# CUDAExecutionProvider молча падает на CPU (cublasLt64_12.dll missing).
-# Если в venv стоят nvidia-*-cu12 wheels (cublas, cudnn, cufft, curand,
-# cuda-runtime, nvrtc) — подключаем их bin-каталоги (cuDNN 9 дозагружает свои
-# engine-DLL через PATH) и предзагружаем библиотеки. Чинит ORT для ВСЕХ нод.
-try:
-    import os as _os
-    if _os.name == "nt":
-        import glob as _glob
-        import nvidia as _nvidia
-        _dirs = []
-        for _p in _nvidia.__path__:
-            _dirs += _glob.glob(_os.path.join(_p, "*", "bin"))
-        for _d in _dirs:
-            try:
-                _os.add_dll_directory(_d)
-            except Exception:
-                pass
-            _os.environ["PATH"] = _d + _os.pathsep + _os.environ.get("PATH", "")
-        if _dirs:
-            import onnxruntime as _ort
-            if hasattr(_ort, "preload_dlls"):
-                _ort.preload_dlls()
-            print(f"[Unblend] onnxruntime: CUDA 12 DLL подключены ({len(_dirs)} каталогов)")
-except Exception as _e:
-    print(f"[Unblend] onnxruntime CUDA fix пропущен: {_e}")
+# ВАЖНО (urok 2026-06-11): НЕ добавлять nvidia-*-cu12 bin в PATH/DLL-пути
+# глобально. cudnn64_9.dll называется одинаково в cu12 и cu13 — Windows грузит
+# DLL по имени один раз на процесс, и torch (cu13) получает чужую cuDNN →
+# UNet выдаёт шум. onnxruntime-gpu (cu12) на GPU в одном процессе с torch cu13
+# несовместим, пока нет ORT-сборки под CUDA 13. ONNX-ноды работают на CPU.
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
