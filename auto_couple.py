@@ -950,11 +950,371 @@ class UnblendBoundedSampler:
         return ({"samples": out}, masks, preview, info_str)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Нода 3: UnblendDynamicSampler — настоящий Bounded Attention
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Одна траектория сэмплинга, один draw-промпт. Каждый шаг:
+#   - cross-attn карты CHARn-токенов копятся (EMA),
+#   - каждые refresh_every шагов из них пересобираются маски,
+#   - cross-attn bias: токены персонажа не влияют на пиксели вне его маски,
+#   - self-attn jail: пиксели разных персонажей не видят друг друга.
+# Ограничения включаются после warmup и ЕДУТ вместе с композицией.
+# Ни фазы 2, ни рестарта с x0 — нет и «серости» repaint'а.
+
+
+class _DynamicState:
+    """Живое состояние: EMA-карты, маски, версионированные bias-кеши."""
+
+    def __init__(self, spans, refresh_every, warmup_steps, map_threshold,
+                 bound_strength, jail_strength, jail_max_seq,
+                 harvest_max_seq=1100, ema_keep=0.6):
+        self.spans = {i: s for i, s in spans.items() if s}
+        self.refresh_every = max(1, refresh_every)
+        self.warmup_steps = warmup_steps
+        self.map_threshold = map_threshold
+        self.bound_strength = bound_strength
+        self.jail_strength = jail_strength
+        self.jail_max_seq = jail_max_seq
+        self.harvest_max_seq = harvest_max_seq
+        self.ema_keep = ema_keep
+
+        self.latent_hw = None
+        self.masks = None        # (rows, H, W) жёсткие
+        self.char_rows = {}      # char_idx -> строка в masks
+        self.mask_version = 0
+        self.ema = {}            # char_idx -> np (h, w)
+        self.ema_hw = {}
+        self.pending = {}        # char_idx -> [np_sum, count] за текущий шаг
+        self.refresh_count = 0
+        self._cross_cache = {}
+        self._jail_cache = {}
+
+    # ── харвест ────────────────────────────────────────────────────────────
+    def harvest(self, probs_mh, seq_q):
+        """probs_mh: (bsz, seq_q, seq_k) — softmax-пробы, среднее по головам."""
+        h, w = activation_hw(seq_q, *self.latent_hw)
+        n_tok = probs_mh.shape[-1]
+        for ci, span in self.spans.items():
+            idx = [p for p in span if p < n_tok]
+            if not idx:
+                continue
+            m = probs_mh[..., idx].mean(dim=-1).mean(dim=0)
+            m = m.view(h, w).float().cpu().numpy()
+            if ci in self.pending and self.pending[ci][0].shape == (h, w):
+                self.pending[ci][0] += m
+                self.pending[ci][1] += 1
+            else:
+                self.pending[ci] = [m, 1]
+
+    def finalize_step(self):
+        """Конец шага: pending -> EMA."""
+        import cv2
+        for ci, (s, cnt) in self.pending.items():
+            new = s / max(1, cnt)
+            if ci in self.ema:
+                old = self.ema[ci]
+                if old.shape != new.shape:
+                    old = cv2.resize(old, (new.shape[1], new.shape[0]),
+                                     interpolation=cv2.INTER_LINEAR)
+                self.ema[ci] = self.ema_keep * old + (1 - self.ema_keep) * new
+            else:
+                self.ema[ci] = new
+        self.pending = {}
+
+    def set_masks(self, masks, char_rows):
+        self.masks = masks
+        self.char_rows = char_rows
+        self.mask_version += 1
+        self._cross_cache.clear()
+        self._jail_cache.clear()
+        self.refresh_count += 1
+
+    # ── bias ───────────────────────────────────────────────────────────────
+    def cross_bias(self, seq_q, seq_k, device, dtype):
+        """(seq_q, seq_k): -1e4 там, где токен персонажа смотрит за маску."""
+        if self.masks is None or self.bound_strength <= 0:
+            return None
+        key = (seq_q, seq_k, self.mask_version, str(device), dtype)
+        if key not in self._cross_cache:
+            h, w = activation_hw(seq_q, *self.latent_hw)
+            m = F.interpolate(self.masks.unsqueeze(1), size=(h, w),
+                              mode="bilinear", align_corners=False)
+            m = m.squeeze(1).reshape(self.masks.shape[0], -1)[:, :seq_q]
+            bias = torch.zeros(seq_q, seq_k, dtype=torch.float32)
+            val = -10000.0 * float(self.bound_strength)
+            for ci, row in self.char_rows.items():
+                span = [p for p in (self.spans.get(ci) or []) if p < seq_k]
+                if not span:
+                    continue
+                outside = m[row] < 0.5            # (seq_q,)
+                bias[outside.nonzero(as_tuple=True)[0][:, None],
+                     torch.tensor(span)] = val
+            self._cross_cache[key] = bias.to(device, dtype=dtype)
+        return self._cross_cache[key]
+
+    def jail_bias_for_seq(self, seq_len, device, dtype):
+        if self.masks is None or self.jail_strength <= 0:
+            return None
+        key = (seq_len, self.mask_version, str(device), dtype)
+        if key not in self._jail_cache:
+            h, w = activation_hw(seq_len, *self.latent_hw)
+            labels = labels_from_masks(self.masks, h, w)[:seq_len]
+            self._jail_cache[key] = jail_bias(
+                labels, self.jail_strength, dtype=torch.float32
+            ).to(device, dtype=dtype)
+        return self._jail_cache[key]
+
+
+def _dyn_attn2_replace(state):
+    """Attention с bias по маскам + харвест карт. Заменяет attn2."""
+
+    def replace(q, k, v, extra_options):
+        heads = extra_options["n_heads"]
+        cou = extra_options["cond_or_uncond"]
+        chunks = len(cou)
+        bsz = q.shape[0] // chunks
+        state.latent_hw = tuple(extra_options["original_shape"][-2:])
+        seq_q, seq_k = q.shape[1], k.shape[1]
+        dim_head = q.shape[2] // heads
+        scale = dim_head ** -0.5
+
+        def split(t, i):
+            c = t[i * bsz:(i + 1) * bsz]
+            return c.view(bsz, -1, heads, dim_head).transpose(1, 2)
+
+        outs = []
+        for i, flag in enumerate(cou):
+            qh, kh, vh = split(q, i), split(k, i), split(v, i)
+            bias = None
+            if flag == 0:
+                bias = state.cross_bias(seq_q, seq_k, q.device, q.dtype)
+            if (flag == 0 and seq_q <= state.harvest_max_seq and state.spans):
+                scores = qh @ kh.transpose(-1, -2) * scale
+                if bias is not None:
+                    scores = scores + bias
+                probs = scores.softmax(dim=-1)
+                try:
+                    state.harvest(probs.mean(dim=1), seq_q)
+                except Exception as e:
+                    if not getattr(state, "_warned", False):
+                        print(f"[UnblendDynamic] harvest error: {e}")
+                        state._warned = True
+                o = probs @ vh
+            else:
+                o = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=bias)
+            outs.append(o.transpose(1, 2).reshape(bsz, seq_q, -1))
+        return torch.cat(outs, dim=0)
+
+    return replace
+
+
+def _dyn_attn1_replace(state):
+    """Self-attn jail по живым маскам (None-bias пока масок нет)."""
+
+    def patch(q, k, v, extra_options):
+        heads = extra_options["n_heads"]
+        b, seq_q, inner = q.shape
+        dim_head = inner // heads
+
+        def split(t):
+            return t.view(b, -1, heads, dim_head).transpose(1, 2)
+
+        bias = None
+        if (state.latent_hw is not None and seq_q == k.shape[1]
+                and seq_q <= state.jail_max_seq):
+            bias = state.jail_bias_for_seq(seq_q, q.device, q.dtype)
+        out = F.scaled_dot_product_attention(split(q), split(k), split(v),
+                                             attn_mask=bias)
+        return out.transpose(1, 2).reshape(b, seq_q, inner)
+
+    return patch
+
+
+class UnblendDynamicSampler:
+    """Bounded Attention: маски из cross-attn карт КАЖДЫЕ N шагов + bias.
+
+    Один проход, один draw-промпт. После warmup токены каждого [CHARn]
+    влияют только на пиксели его живой маски; self-attn jail режет
+    подглядывание между персонажами. Маски едут вместе с композицией.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "latent_image": ("LATENT",),
+                "prompt": ("STRING", {"multiline": True, "default":
+                    "[QUALITY] masterpiece, best quality\n"
+                    "[STYLE] anime style\n"
+                    "[SCENE] simple background\n"
+                    "[CHAR1] columbina (genshin impact), black hair, white dress\n"
+                    "[CHAR2] fischl (genshin impact), blonde hair, eyepatch\n"
+                    "[INTERACT] embracing, face to face"}),
+                "negative_prompt": ("STRING", {"multiline": True, "default":
+                    "lowres, worst quality, low quality, bad anatomy, bad hands"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "steps": ("INT", {"default": 32, "min": 8, "max": 200}),
+                "cfg": ("FLOAT", {"default": 5.5, "min": 0.5, "max": 20.0, "step": 0.5}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "warmup_at": ("FLOAT", {"default": 0.15, "min": 0.03, "max": 0.6, "step": 0.01}),
+                "refresh_every": ("INT", {"default": 4, "min": 1, "max": 16}),
+                "mask_source": (["attn_maps+silhouette", "attn_maps"],),
+                "map_threshold": ("FLOAT", {"default": 0.35, "min": 0.05, "max": 0.95, "step": 0.05}),
+                "bound_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "self_attn_jail": ("BOOLEAN", {"default": True}),
+                "jail_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "subject_word": ("STRING", {"default": "girl"}),
+            },
+            "optional": {
+                "vae": ("VAE",),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "MASK", "IMAGE", "STRING")
+    RETURN_NAMES = ("latent", "char_masks", "mask_preview", "info")
+    FUNCTION = "run"
+    CATEGORY = "Unblend"
+
+    def run(self, model, clip, latent_image, prompt, negative_prompt, seed,
+            steps, cfg, sampler_name, scheduler, warmup_at, refresh_every,
+            mask_source, map_threshold, bound_strength, self_attn_jail,
+            jail_strength, subject_word, vae=None):
+        import comfy.sample
+
+        _check_sdxl(model)
+        info = []
+
+        latent = comfy.sample.fix_empty_latent_channels(
+            model, latent_image["samples"])
+        if latent.shape[0] != 1:
+            print("[UnblendDynamic] batch>1 пока не поддержан, беру первый")
+            latent = latent[:1]
+        H, W = latent.shape[-2:]
+
+        sections = parse_prompt(prompt)
+        char_texts = [_clean(sections[f"char{i}"]) for i in range(1, 5)]
+        present = [c for c in char_texts if c]
+        if len(present) < 2:
+            raise ValueError("[UnblendDynamic] нужно минимум 2 заполненных [CHARn]")
+        draw, _, _ = build_blocks(prompt, subject_word=(subject_word.strip() or "girl"))
+
+        draw_cond = UnblendBoundedSampler._encode(clip, draw)
+        neg_cond = UnblendBoundedSampler._encode(clip, negative_prompt)
+        spans = find_char_spans(clip, draw, present)
+        missing = [i + 1 for i, s in spans.items() if not s]
+        if missing:
+            info.append(f"токены CHAR{missing} не найдены — без ограничений для них")
+
+        warmup_steps = max(2, round(steps * warmup_at))
+        state = _DynamicState(
+            spans, refresh_every, warmup_steps, map_threshold,
+            bound_strength, jail_strength, jail_max_seq=4096)
+        info.append(f"персонажей: {len(present)}, warmup {warmup_steps}/{steps}, "
+                    f"refresh каждые {refresh_every}")
+
+        m = model.clone()
+        patch2 = _dyn_attn2_replace(state)
+        for name, count in (("input", 12), ("middle", 1), ("output", 12)):
+            for number in range(count):
+                for t_idx in range(10):
+                    m.set_model_attn2_replace(patch2, name, number, t_idx)
+        if self_attn_jail:
+            _register_attn1_everywhere(m, _dyn_attn1_replace(state))
+
+        use_sil = mask_source == "attn_maps+silhouette" and vae is not None
+        if mask_source == "attn_maps+silhouette" and vae is None:
+            info.append("vae не подключён — силуэт выключен")
+
+        def refresh_masks(x0):
+            fg = None
+            if use_sil:
+                try:
+                    from PIL import Image
+                    from .deepghs_nodes import silhouette_fg
+                    img_t = vae.decode(x0)
+                    img = (np.clip(img_t[0].cpu().numpy(), 0, 1) * 255).astype(np.uint8)
+                    fg = silhouette_fg(Image.fromarray(img, "RGB"))
+                except Exception as e:
+                    print(f"[UnblendDynamic] силуэт не получился: {e}")
+            keys = sorted(state.ema.keys())
+            maps = [state.ema[k] for k in keys]
+            if len(maps) < 2:
+                return
+            thr = float(map_threshold)
+            while True:
+                masks_all, _, ok = build_masks_from_maps(
+                    maps, H, W, map_threshold=thr, fg=fg)
+                good = [k for k, o in zip(keys, ok) if o]
+                if len(good) >= 2 or thr <= 0.16:
+                    break
+                thr = round(thr - 0.1, 2)
+            if len(good) < 2:
+                return  # оставляем прежние маски
+            rows = [keys.index(g) for g in good]
+            masks_sel = masks_all[rows]
+            if fg is not None:
+                masks_sel = fill_silhouette(masks_sel, fg)
+            state.set_masks(masks_sel, {g: r for r, g in enumerate(good)})
+
+        def cb(step, x0, x, total_steps):
+            state.finalize_step()
+            done = step + 1
+            if done >= warmup_steps and (
+                    state.masks is None
+                    or (done - warmup_steps) % state.refresh_every == 0):
+                refresh_masks(x0)
+
+        noise = comfy.sample.prepare_noise(latent, seed, None)
+        out = self._run_sample(m, noise, steps, cfg, sampler_name, scheduler,
+                               draw_cond, neg_cond, latent, seed, cb)
+
+        if state.masks is not None:
+            masks = state.masks
+            background = (masks.sum(dim=0) < 0.5).float()
+            areas = [f"{masks[i].mean() * 100:.1f}%" for i in range(masks.shape[0])]
+            info.append(f"refresh'ей: {state.refresh_count}, маски: {areas}")
+            preview = UnblendBoundedSampler._mask_preview(masks, background)
+        else:
+            masks = torch.zeros(1, H, W)
+            background = torch.ones(H, W)
+            info.append("маски так и не собрались — прогон без ограничений")
+            if state.ema:
+                keys = sorted(state.ema.keys())
+                preview = UnblendBoundedSampler._heatmap_preview(
+                    [state.ema[k] for k in keys], H, W)
+            else:
+                preview = UnblendBoundedSampler._mask_preview(masks, background)
+
+        info_str = " | ".join(info)
+        print(f"[UnblendDynamic] {info_str}")
+        return ({"samples": out}, masks, preview, info_str)
+
+    @staticmethod
+    def _run_sample(model, noise, steps, cfg, sampler_name, scheduler,
+                    positive, negative, latent, seed, callback):
+        import comfy.sample
+        import comfy.utils
+        return comfy.sample.sample(
+            model, noise, steps, cfg, sampler_name, scheduler,
+            positive, negative, latent,
+            denoise=1.0, disable_noise=False,
+            start_step=None, last_step=None, force_full_denoise=True,
+            noise_mask=None, callback=callback,
+            disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed)
+
+
 NODE_CLASS_MAPPINGS = {
     "UnblendCoupleApply": UnblendCoupleApply,
     "UnblendBoundedSampler": UnblendBoundedSampler,
+    "UnblendDynamicSampler": UnblendDynamicSampler,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UnblendCoupleApply": "Unblend Couple Apply (SDXL + jail)",
-    "UnblendBoundedSampler": "Unblend Bounded Sampler (1-pass)",
+    "UnblendBoundedSampler": "Unblend Bounded Sampler (2-phase)",
+    "UnblendDynamicSampler": "Unblend Dynamic Sampler (Bounded Attention)",
 }
