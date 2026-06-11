@@ -1,0 +1,126 @@
+# ComfyUI-Unblend
+
+Авто-разделение персонажей на аниме-артах без смешивания черт
+(**character blending**: волосы/одежда/глаза перетекают между персонажами
+на артах с 2+ персонажами). Под SDXL / Illustrious и совместимые файнтюны.
+
+Идея: найти каждого персонажа (даже когда тела слиплись — объятия, поцелуй),
+получить точную маску на каждого, превратить маски во взаимоисключающие
+регионы и скормить их региональному attention couple. Плюс утилиты,
+убирающие ручную рутину (сборка промптов, позы, счётчик строк).
+
+---
+
+## Ноды
+
+| Нода | Что делает |
+|---|---|
+| **Anime Char Detect + Seg** | YOLO-seg детект (person_yolov8m-seg или любой свой `.pt`). Быстрый, но слипшихся персонажей часто видит как один instance. |
+| **Deepghs Char Seg (detect+segment)** | Главный детектор: deepghs-модели (person/head) + сегментация силуэта isnetis. Разделяет даже слипшиеся тела. Режимы `mask_mode` (silhouette/zones) и `divider` (straight / nearest_center / nearest_silhouette). |
+| **Char Masks -> Regions** | Режет instance-маски на взаимоисключающие регионы `mask_1..4` + `background` (0 дыр, 0 перекрытий), с feather. |
+| **Unblend Prompt Builder** | Один тегированный промпт → готовые блоки draw / base / region_1..4 (текст + CONDITIONING, если подключить CLIP). Убирает копипасту стиля/позы по 4–6 окнам. |
+| **Unblend Pose Engine** | Извлечение поз с выбором движка: `rtmlib_humanart` (RTMPose + HumanArt — видит аниме-пропорции, рекомендуется) или `dwpose`. Отдаёт OpenPose-картинку для ControlNet + JSON тел. Умеет брать боксы от детектора («один скелет на персонажа»). |
+| **Unblend SAM2 Char Masks** | Instance-маски через SAM2, промптится боксами от голов+силуэта (не текстом) — чистые края по контуру тела. Нужен пакет `sam2` и чекпойнт в `ComfyUI/models/sam2/`. |
+| **Unblend Line Counter** | Номер строки промпт-файла с авто-продвижением: repeat / increment / random / fixed. Для конвейера «файл промптов → поток артов». |
+| **Unblend Attention Couple** | ⚠️ Экспериментальная, НЕ рабочая. Для регионального attention используй **A8R8 AttentionCoupleRegion** или **ComfyUI-ppm** — маски наших нод с ними полностью совместимы. |
+
+### Какой детектор брать
+- Персонажи стоят раздельно → любой, YOLO быстрее.
+- Слиплись / обнимаются / целуются → **Deepghs Char Seg** (detect_target=`head`
+  надёжнее: головы раздельны, даже когда тела сливаются) или **SAM2 Char Masks**.
+
+---
+
+## Установка
+
+1. Склонировать в кастом-ноды:
+   ```
+   cd ComfyUI/custom_nodes
+   git clone https://github.com/TheMrLordicus/ComfyUI-Unblend
+   ```
+2. Поставить зависимости в окружение ComfyUI:
+   ```
+   pip install -r ComfyUI-Unblend/requirements.txt
+   ```
+   (Windows portable: `.\python_embeded\python.exe -m pip install -r ...`)
+3. Веса:
+   - deepghs-модели (детект/сегментация/позы) качаются **автоматически** с HuggingFace при первом запуске;
+   - для YOLO-ноды: скачать `person_yolov8m-seg.pt` с
+     [Bingsu/adetailer](https://huggingface.co/Bingsu/adetailer) →
+     положить в `ComfyUI/models/yolo/`;
+   - для SAM2-ноды (опционально): пакет `pip install sam2` + чекпойнт
+     (напр. `sam2.1_hiera_large.pt`) в `ComfyUI/models/sam2/`.
+4. Перезапустить ComfyUI. В логе должно быть `[Unblend] загружено нод: 8 (...)`.
+   Если меньше — рядом будет строка с причиной (обычно недоставленная зависимость).
+
+Каждый модуль грузится независимо: ошибка в одном (например, нет `sam2`)
+не мешает остальным нодам появиться.
+
+---
+
+## Рабочий пайплайн (проверенный)
+
+1. **KSampler #1** (черновик) — полный промпт + поза, **25 шагов**
+   (при 15 детект мажет, 25 даёт чёткость).
+2. VAE Decode → **Deepghs Char Seg** (`mask_mode: zones`) → **Char Masks -> Regions**.
+3. Маски → **A8R8 AttentionCoupleRegion**: `mask_1`→регион 1, `mask_2`→регион 2,
+   `background`→base_mask.
+4. **KSampler #2**: model ← A8R8, **latent ← от KSampler #1**, **denoise 0.9**,
+   тот же seed. (1.0 ломает композицию, 0.5 душит качество.)
+5. VAE Decode → детейлеры (лица/руки) → upscale → финал.
+
+### Матрица «поза → настройки Deepghs Char Seg»
+
+| Поза | detect_target | divider |
+|---|---|---|
+| Стоят рядом | person | straight |
+| Обнимаются стоя | person | nearest_silhouette + feather |
+| Лежат / склонилась сверху | head | nearest_center |
+| Танец / диагональ | person | nearest_center |
+| Спина к спине | person | straight |
+| Поцелуй лицом к лицу | head | nearest_center |
+| На коленях (макс. перекрытие) | head | nearest_silhouette |
+
+### Правила промптинга для attention couple
+
+- Слова взаимодействия (kiss, embrace, lying together) — в **оба** региона:
+  взаимодействие происходит на стыке тел, в base оно не срабатывает.
+- Признаки персонажа — **только** в его регион.
+- Стиль/качество/фон — в base.
+- Поза одинаковая в draw + base + обоих регионах.
+
+**Unblend Prompt Builder** делает эту маршрутизацию автоматически. Формат входа
+(порядок тегов не важен, лишние можно опустить):
+
+```
+[QUALITY] masterpiece, best quality
+[STYLE]   anime style, cel shaded
+[SCENE]   night sky background
+[CAMERA]  dynamic angle, bokeh
+[CHAR1]   columbina (genshin impact), black hair, white dress
+[CHAR2]   fischl (genshin impact), blonde hair, eyepatch
+[BODY]    slim body
+[INTERACT] embracing, face to face, deep kiss
+```
+
+Маршрутизация: QUALITY/STYLE/SCENE/CAMERA → draw+base; CHARn → draw+region_n;
+BODY → все регионы; INTERACT → draw+base+все регионы; счётчик `2girls`/`1girl`
+проставляется сам (`subject_word` настраивается).
+
+---
+
+## Зависимости
+
+- `ultralytics`, `opencv-python`, `numpy` — YOLO-нода
+- `dghs-realutils`, `dghs-imgutils` — Deepghs-ноды (детект/сегментация/dwpose)
+- `rtmlib` — движок поз rtmlib_humanart (onnxruntime, без mmcv)
+- `sam2` — опционально, только для SAM2-ноды
+
+⚠️ Метка «unsafe pickle» на HF у `.pt`-весов ultralytics — норма для всего
+семейства. Аниме-специфичные YOLO-детекторы:
+[Anzhc/Anzhcs_YOLOs](https://huggingface.co/Anzhc/Anzhcs_YOLOs).
+
+## Если что-то падает
+
+Скопируй полный traceback из консоли ComfyUI и открой issue. Полезно приложить
+строку `[Unblend] загружено нод: ...` из лога старта.

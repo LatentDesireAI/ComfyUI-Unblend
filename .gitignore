@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+
+# Приватные рабочие заметки и логи (не для репозитория)
+HANDOFF.md
+crash_log.txt
+*.log
+
+# Веса моделей (качаются автоматически / кладутся в ComfyUI/models)
+*.pt
+*.pth
+*.onnx

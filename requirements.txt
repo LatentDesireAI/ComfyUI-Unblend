@@ -1,0 +1,6 @@
+ultralytics>=8.3.0
+opencv-python
+numpy
+dghs-realutils
+dghs-imgutils
+rtmlib
