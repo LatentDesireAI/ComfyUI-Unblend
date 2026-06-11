@@ -712,7 +712,13 @@ class UnblendBoundedSampler:
                 canvas[..., c] += t * (palette[i % 4][c] / 255.0)
         canvas = canvas.clamp(0, 1).permute(2, 0, 1).unsqueeze(0)
         canvas = F.interpolate(canvas, scale_factor=scale, mode="nearest")
-        return canvas.permute(0, 2, 3, 1)
+        out = canvas.permute(0, 2, 3, 1)
+        # подпись прямо в картинке — чтобы фолбэк не путали с масками
+        import cv2
+        img = (out[0].numpy() * 255).astype(np.uint8).copy()
+        cv2.putText(img, "RAW ATTN MAPS — FALLBACK, NO MASKS", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        return torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
 
     @staticmethod
     def _mask_preview(masks, background, scale=6):
@@ -851,9 +857,17 @@ class UnblendBoundedSampler:
                     if ci in harvester.acc:
                         maps.append(harvester.acc[ci])
                         keep.append(j)
-                masks_all, background, ok = build_masks_from_maps(
-                    maps, H, W, map_threshold=map_threshold, fg=fg)
-                good = [k for k, o in zip(keep, ok) if o]
+                # авто-релакс: высокий порог не должен молча убивать couple
+                thr = float(map_threshold)
+                while True:
+                    masks_all, background, ok = build_masks_from_maps(
+                        maps, H, W, map_threshold=thr, fg=fg)
+                    good = [k for k, o in zip(keep, ok) if o]
+                    if len(good) >= 2 or thr <= 0.16:
+                        break
+                    thr = round(thr - 0.1, 2)
+                if len(good) >= 2 and abs(thr - float(map_threshold)) > 1e-6:
+                    info.append(f"порог авто-снижен {map_threshold} -> {thr}")
                 if len(good) >= 2:
                     masks = masks_all[[keep.index(g) for g in good]]
                     region_conds_full = [region_conds_full[g] for g in good]
@@ -867,7 +881,7 @@ class UnblendBoundedSampler:
                                  for i in range(len(good))]
                         info.append(f"+силуэт: {areas}")
                 else:
-                    info.append(f"карты слабые (порог {map_threshold}) — фолбэк без couple")
+                    info.append("карты слабые даже на пороге 0.15 — фолбэк без couple")
                     masks = None
 
         # ── фаза 2 ─────────────────────────────────────────────────────────
