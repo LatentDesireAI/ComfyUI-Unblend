@@ -178,6 +178,41 @@ def build_masks_from_maps(char_maps, latent_h, latent_w, map_threshold=0.35,
     return masks, background, ok
 
 
+def fill_silhouette(masks, fg):
+    """Достроить маски до полного тела: непокрытые пиксели силуэта
+    раздаются БЛИЖАЙШЕЙ маске (distance transform).
+
+    Attn-карты светятся в основном на головах/торсах (различительные токены —
+    лица, волосы) — одежда/ноги остаются фоном, и couple их не держит.
+    Силуэт знает габариты тел; этот шаг отдаёт их владельцам.
+
+    masks: (n, H, W) жёсткие 0/1; fg: (h?, w?) силуэт — ресайзится тут.
+    """
+    import cv2
+    n, H, W = masks.shape
+    fg_t = torch.as_tensor(np.asarray(fg), dtype=torch.float32)
+    if fg_t.shape != (H, W):
+        fg_t = F.interpolate(fg_t.view(1, 1, *fg_t.shape), size=(H, W),
+                             mode="bilinear", align_corners=False)[0, 0]
+    fgb = (fg_t > 0.5).numpy()
+
+    dists = []
+    for i in range(n):
+        src = (masks[i] > 0.5).numpy().astype(np.uint8)
+        if src.sum() == 0:
+            dists.append(np.full((H, W), np.inf, dtype=np.float32))
+            continue
+        dists.append(cv2.distanceTransform(1 - src, cv2.DIST_L2, 3))
+    owner = np.argmin(np.stack(dists), axis=0)
+
+    out = masks.clone()
+    unassigned = fgb & (masks.sum(dim=0).numpy() < 0.5)
+    for i in range(n):
+        add = unassigned & (owner == i) & np.isfinite(dists[i])
+        out[i] = torch.clamp(out[i] + torch.from_numpy(add.astype(np.float32)), 0, 1)
+    return out
+
+
 def feather_masks(masks, feather):
     """Мягкие края: box-blur ядром (2f+1), маски остаются нормированными суммой далее."""
     if feather <= 0:
@@ -824,6 +859,13 @@ class UnblendBoundedSampler:
                     region_conds_full = [region_conds_full[g] for g in good]
                     areas = [f"{masks[i].mean() * 100:.1f}%" for i in range(len(good))]
                     info.append(f"маски из attn-карт: {areas}")
+                    if fg is not None:
+                        # карты светятся на головах — достраиваем до полного
+                        # тела по силуэту, иначе одежда остаётся в base-зоне
+                        masks = fill_silhouette(masks, fg)
+                        areas = [f"{masks[i].mean() * 100:.1f}%"
+                                 for i in range(len(good))]
+                        info.append(f"+силуэт: {areas}")
                 else:
                     info.append(f"карты слабые (порог {map_threshold}) — фолбэк без couple")
                     masks = None

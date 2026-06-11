@@ -82,6 +82,22 @@ spans_p = {0: [1, 2, 3], 1: [4, 5, 6]}
 d2 = ac.distinctive_positions(spans_p, needles_p)
 check("distinctive: < 2 уникальных -> исходный спан", d2[0] == [1, 2, 3], str(d2))
 
+# 4d. fill_silhouette: непокрытый силуэт раздаётся ближайшей маске
+fg_full = np.zeros((104, 152), np.float32)
+fg_full[10:100, 20:130] = 1.0  # общий силуэт двух фигур
+seeds = torch.zeros(2, 104, 152)
+seeds[0, 15:35, 30:55] = 1.0   # «голова» слева
+seeds[1, 15:35, 95:120] = 1.0  # «голова» справа
+filled = ac.fill_silhouette(seeds, fg_full)
+cover = float((filled.sum(0) * torch.from_numpy(fg_full)).sum() /
+              fg_full.sum())
+check("fill: силуэт покрыт", cover > 0.999, f"{cover:.4f}")
+check("fill: без пересечений", float((filled[0] * filled[1]).sum()) == 0.0)
+check("fill: низ слева у первой", float(filled[0][90, 40]) == 1.0)
+check("fill: низ справа у второй", float(filled[1][90, 110]) == 1.0)
+check("fill: вне силуэта пусто",
+      float(filled[:, :5, :].sum() + filled[:, :, :15].sum()) == 0.0)
+
 # 5. jail_bias
 lab = torch.tensor([0, 1, 1, 2])
 b = ac.jail_bias(lab, strength=1.0)
