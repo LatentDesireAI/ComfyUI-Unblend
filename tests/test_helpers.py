@@ -114,6 +114,23 @@ soft = ac.feather_masks(masks, 4)
 check("feather форма", soft.shape == masks.shape)
 check("feather мягче", float(((soft > 0) & (soft < 1)).sum()) > 0)
 
+# 6b. UnblendZoneMasks (RP matrix)
+zm = ac.UnblendZoneMasks()
+m1z, m2z, m3z, m4z, bgz = zm.make(832, 1216, "1,1", "horizontal", 0)
+check("zones форма", m1z.shape == (1, 1216, 832), str(m1z.shape))
+check("zones пополам", abs(float(m1z.mean()) - 0.5) < 0.01
+      and abs(float(m2z.mean()) - 0.5) < 0.01)
+check("zones лево/право", float(m1z[0, :, :416].mean()) == 1.0
+      and float(m2z[0, :, 416:].mean()) == 1.0)
+check("zones пустые слоты", float(m3z.sum()) == 0 and float(m4z.sum()) == 0)
+check("zones background ноль", float(bgz.sum()) == 0)
+m1r, m2r, _, _, _ = zm.make(832, 1216, "2,1", "horizontal", 0)
+check("zones ratio 2:1", abs(float(m1r.mean()) - 2 / 3) < 0.01,
+      f"{float(m1r.mean()):.3f}")
+m1v, m2v, _, _, _ = zm.make(832, 1216, "1,1", "vertical", 8)
+check("zones vertical + feather", float(m1v[0, :600, :].mean()) > 0.95
+      and float(((m1v > 0) & (m1v < 1)).sum()) > 0)
+
 # 7. lcm
 check("lcm", ac._lcm_list([77, 154, 231]) == 462)
 

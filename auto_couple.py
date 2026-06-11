@@ -966,6 +966,71 @@ class UnblendBoundedSampler:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Нода: UnblendZoneMasks — фиксированные зоны (Matrix-режим Regional Prompter)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class UnblendZoneMasks:
+    """Зоны по ratio, как Matrix-режим sd-webui-regional-prompter.
+
+    Без детекта, без силуэтов, без ожидания — маски готовы С ШАГА 0.
+    ratios "1,1" = пополам, "2,1" = 2/3 + 1/3, до 4 зон. Подключай в
+    Unblend Couple Apply (mask_1->cond_1 и т.д.; background -> base_mask)
+    + обычный KSampler. Надёжная база для стоящих рядом персонажей;
+    для объятий/нахлёста лучше Dynamic Sampler.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "width": ("INT", {"default": 832, "min": 64, "max": 8192, "step": 8}),
+                "height": ("INT", {"default": 1216, "min": 64, "max": 8192, "step": 8}),
+                "ratios": ("STRING", {"default": "1,1"}),
+                "direction": (["horizontal", "vertical"],),
+                "feather": ("INT", {"default": 16, "min": 0, "max": 256, "step": 2}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "MASK", "MASK", "MASK", "MASK")
+    RETURN_NAMES = ("mask_1", "mask_2", "mask_3", "mask_4", "background")
+    FUNCTION = "make"
+    CATEGORY = "Unblend"
+
+    def make(self, width, height, ratios, direction, feather):
+        rs = [float(x) for x in ratios.replace(";", ",").split(",")
+              if x.strip()]
+        rs = [r for r in rs if r > 0][:4]
+        if not rs:
+            rs = [1.0, 1.0]
+        n = len(rs)
+        total = sum(rs)
+        L = width if direction == "horizontal" else height
+
+        edges = [0]
+        acc = 0.0
+        for r in rs:
+            acc += r / total
+            edges.append(int(round(acc * L)))
+        edges[-1] = L
+
+        masks = torch.zeros(4, height, width)
+        for i in range(n):
+            a, b = edges[i], edges[i + 1]
+            if direction == "horizontal":
+                masks[i, :, a:b] = 1.0
+            else:
+                masks[i, a:b, :] = 1.0
+        if feather > 0:
+            # мягкий стык зон (в пикселях); нормировка по сумме в couple
+            masks[:n] = feather_masks(masks[:n], int(feather) // 2)
+
+        background = torch.zeros(height, width)
+        out = [masks[i].unsqueeze(0) for i in range(4)]
+        return (*out, background.unsqueeze(0))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Нода 3: UnblendDynamicSampler — настоящий Bounded Attention
 # ══════════════════════════════════════════════════════════════════════════════
 #
@@ -1521,11 +1586,13 @@ class UnblendDynamicSampler:
 
 NODE_CLASS_MAPPINGS = {
     "UnblendCoupleApply": UnblendCoupleApply,
+    "UnblendZoneMasks": UnblendZoneMasks,
     "UnblendBoundedSampler": UnblendBoundedSampler,
     "UnblendDynamicSampler": UnblendDynamicSampler,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UnblendCoupleApply": "Unblend Couple Apply (SDXL + jail)",
+    "UnblendZoneMasks": "Unblend Zone Masks (RP matrix)",
     "UnblendBoundedSampler": "Unblend Bounded Sampler (2-phase)",
     "UnblendDynamicSampler": "Unblend Dynamic Sampler (Bounded Attention)",
 }
