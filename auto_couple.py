@@ -1288,7 +1288,10 @@ class UnblendDynamicSampler:
 
         state.last_mode = "—"
 
-        def refresh_masks(x0):
+        def _log(done, msg):
+            print(f"[UnblendDynamic] refresh@{done}: {msg}")
+
+        def refresh_masks(x0, done):
             fg = None
             pil = None
             if use_sil:
@@ -1308,7 +1311,7 @@ class UnblendDynamicSampler:
             if pil is not None and fg is not None and state.ema:
                 try:
                     from .deepghs_nodes import detect_heads_backend, _dedup_boxes
-                    heads, hconf = detect_heads_backend(pil, 0.3, 0.45, None)
+                    heads, hconf = detect_heads_backend(pil, 0.25, 0.45, None)
                     heads, hconf = _dedup_boxes(
                         heads, hconf, 0.05 * min(pil.size))
                     if len(heads) >= 2:
@@ -1321,10 +1324,17 @@ class UnblendDynamicSampler:
                             state.set_masks(
                                 vmasks, {ci: r for r, ci in enumerate(order)})
                             state.last_mode = "heads+attn-id"
+                            areas = [f"{vmasks[i].mean() * 100:.0f}%"
+                                     for i in range(vmasks.shape[0])]
+                            _log(done, f"heads={len(heads)} -> heads+attn-id, "
+                                       f"маски {areas}")
                             return
+                    _log(done, f"heads={len(heads)} (<2) -> attn-only")
                 except Exception as e:
-                    print(f"[UnblendDynamic] heads-режим не сработал ({e}), "
-                          f"откат на attn-конкуренцию")
+                    _log(done, f"heads-режим упал ({e}) -> attn-only")
+            else:
+                _log(done, f"без силуэта (pil={pil is not None}, "
+                           f"ema={len(state.ema)}) -> attn-only")
 
             state.last_mode = "attn-only"
             keys = sorted(state.ema.keys())
@@ -1340,12 +1350,21 @@ class UnblendDynamicSampler:
                     break
                 thr = round(thr - 0.1, 2)
             if len(good) < 2:
-                return  # оставляем прежние маски
+                _log(done, "attn-only: карты слабые, маски не обновлены")
+                return
             rows = [keys.index(g) for g in good]
             masks_sel = masks_all[rows]
             if fg is not None:
                 masks_sel = fill_silhouette(masks_sel, fg)
+            # страховка от доминирования: перекошенные attn-маски вреднее,
+            # чем отсутствие масок (bias зацементирует перекос)
+            fr = [float(masks_sel[i].mean()) for i in range(masks_sel.shape[0])]
+            if min(fr) < 0.05 or max(fr) / max(min(fr), 1e-9) > 4.0:
+                _log(done, f"attn-only: дисбаланс {[f'{a*100:.0f}%' for a in fr]}"
+                           f" — маски не обновлены")
+                return
             state.set_masks(masks_sel, {g: r for r, g in enumerate(good)})
+            _log(done, f"attn-only, маски {[f'{a*100:.0f}%' for a in fr]}")
 
         def cb(step, x0, x, total_steps):
             state.finalize_step()
@@ -1353,7 +1372,7 @@ class UnblendDynamicSampler:
             if done >= warmup_steps and (
                     state.masks is None
                     or (done - warmup_steps) % state.refresh_every == 0):
-                refresh_masks(x0)
+                refresh_masks(x0, done)
 
         noise = comfy.sample.prepare_noise(latent, seed, None)
         out = self._run_sample(m, noise, steps, cfg, sampler_name, scheduler,
