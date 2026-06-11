@@ -1327,6 +1327,29 @@ def column_voronoi_masks(fg, head_boxes, latent_h, latent_w):
     return torch.stack(masks)
 
 
+def clip_zones_by_fg(masks, fg, min_frac=0.03):
+    """Обрезать полнокадровые зоны силуэтом: фон достаётся base-промпту.
+
+    Токены персонажа на фоне его половины (деревья, небо) — канал утечки
+    «вся сцена стала цвета персонажа». После обрезки на фоновых пикселях
+    подавлены токены ОБОИХ персонажей -> там правят слова сцены.
+    Если от зоны почти ничего не осталось (персонаж без тела в кадре или
+    осечка силуэта) — оставляем ему полную половину (фолбэк).
+    """
+    n, H, W = masks.shape
+    fg_t = torch.as_tensor(np.asarray(fg), dtype=torch.float32)
+    if fg_t.shape != (H, W):
+        fg_t = F.interpolate(fg_t.view(1, 1, *fg_t.shape), size=(H, W),
+                             mode="bilinear", align_corners=False)[0, 0]
+    fgb = (fg_t > 0.5).float()
+    out = masks.clone()
+    for i in range(n):
+        clipped = masks[i] * fgb
+        if float(clipped.sum()) >= min_frac * H * W:
+            out[i] = clipped
+    return out
+
+
 def _stabilize_identity(state, new_masks, rows_map):
     """Не дать персонажам «поменяться местами» между refresh'ами.
 
@@ -1660,12 +1683,16 @@ class UnblendDynamicSampler:
                     _log(done, f"пики слиплись (dist={dist:.2f}) — без обновления")
                     return
                 lmasks = straight_divider_masks(peaks, H, W)
+                clipped = ""
+                if fg is not None:
+                    lmasks = clip_zones_by_fg(lmasks, fg)
+                    clipped = " (обрезаны силуэтом, фон -> base)"
                 rows_map = _stabilize_identity(
                     state, lmasks, {keys[0]: 0, keys[1]: 1})
                 state.set_masks(lmasks, rows_map, soft=True)
                 state.last_mode = "peak-line (soft)"
                 _log(done, f"линия по пикам ({ax:.0f},{ay:.0f})-({bx:.0f},{by:.0f}), "
-                           f"мягкие зоны")
+                           f"мягкие зоны{clipped}")
                 return
 
             # ── 3+ персонажа: старая конкуренция карт ──────────────────────

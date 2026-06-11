@@ -222,6 +222,20 @@ ca = [float(cvm[i].mean()) for i in range(2)]
 check("columns: баланс", max(ca) / max(min(ca), 1e-9) < 1.5, str(ca))
 check("columns: левый не лезет вправо", float(cvm[0][:, 90:].sum()) == 0.0)
 
+# ── clip_zones_by_fg: фон выпадает из зон ──────────────────────────────────
+halves = ac.straight_divider_masks([(30.0, 52.0), (120.0, 52.0)], 104, 152)
+fg_small = _np.zeros((104, 152), _np.float32)
+fg_small[20:90, 30:120] = 1.0  # силуэт в центре
+cz = ac.clip_zones_by_fg(halves, fg_small)
+check("clip: фон убран", float(cz[0][:10, :].sum() + cz[1][:10, :].sum()) == 0.0)
+check("clip: тело осталось", float(cz[0][50, 40]) == 1.0
+      and float(cz[1][50, 110]) == 1.0)
+fg_left_only = _np.zeros((104, 152), _np.float32)
+fg_left_only[20:90, 5:70] = 1.0  # персонаж 2 отсутствует в кадре
+cz2 = ac.clip_zones_by_fg(halves, fg_left_only)
+check("clip: пустая зона -> фолбэк на половину",
+      abs(float(cz2[1].mean()) - float(halves[1].mean())) < 1e-6)
+
 # ── ema_peaks_latent ───────────────────────────────────────────────────────
 pm = {0: _np.zeros((26, 38), _np.float32), 1: _np.zeros((26, 38), _np.float32)}
 pm[0][6, 9] = 1.0   # пик слева-сверху
