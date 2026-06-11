@@ -1134,6 +1134,47 @@ def voronoi_char_masks(fg, head_boxes, latent_h, latent_w):
     return torch.stack(masks)
 
 
+def watershed_char_masks(pil, fg, head_boxes, latent_h, latent_w):
+    """Зоны по РЕАЛЬНЫМ краям картинки (watershed от голов).
+
+    Евклидов Вороной при позах «склонилась сверху / внахлёст» режет по
+    диагонали через оба тела — одежда уезжает соседке. Watershed ведёт
+    границу по визуальному шву (край одежды/кожи). Сиды — центры голов,
+    фон — отдельный маркер, остатки — ближайшему центру.
+    """
+    import cv2
+    fg_np = np.asarray(fg).astype(np.uint8)
+    if fg_np.ndim == 3:
+        fg_np = fg_np[..., 0]
+    h, w = fg_np.shape
+    centers = [((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) for b in head_boxes]
+    n_c = len(centers)
+
+    markers = np.zeros((h, w), np.int32)
+    markers[fg_np == 0] = n_c + 1   # фон не даёт зонам выползать за силуэт
+    seed_r = max(3, int(0.012 * min(h, w)))
+    for i, (cx, cy) in enumerate(centers):
+        cv2.circle(markers, (int(cx), int(cy)), seed_r, i + 1, -1)
+    img3 = np.ascontiguousarray(np.array(pil)[:, :, ::-1])  # RGB -> BGR
+    cv2.watershed(img3, markers)
+
+    owner = np.full((h, w), -1, np.int32)
+    for i in range(n_c):
+        owner[markers == i + 1] = i
+    leftover = owner < 0
+    if leftover.any():
+        yy, xx = np.mgrid[0:h, 0:w]
+        dmaps = [((xx - cx) ** 2 + (yy - cy) ** 2) for cx, cy in centers]
+        owner[leftover] = np.argmin(np.stack(dmaps), axis=0)[leftover].astype(np.int32)
+
+    masks = []
+    for i in range(n_c):
+        m = ((owner == i) & (fg_np > 0)).astype(np.float32)
+        m = cv2.resize(m, (latent_w, latent_h), interpolation=cv2.INTER_LINEAR)
+        masks.append(torch.from_numpy((m > 0.5).astype(np.float32)))
+    return torch.stack(masks)
+
+
 def _stabilize_identity(state, new_masks, rows_map):
     """Не дать персонажам «поменяться местами» между refresh'ами.
 
@@ -1267,6 +1308,9 @@ class UnblendDynamicSampler:
                 "self_attn_jail": ("BOOLEAN", {"default": True}),
                 "jail_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "subject_word": ("STRING", {"default": "girl"}),
+                # watershed: граница зон по краям картинки (одежда/кожа) —
+                # для объятий/поцелуев. nearest_center: чистый Вороной.
+                "divider": (["watershed", "nearest_center"],),
             },
             "optional": {
                 "vae": ("VAE",),
@@ -1281,7 +1325,7 @@ class UnblendDynamicSampler:
     def run(self, model, clip, latent_image, prompt, negative_prompt, seed,
             steps, cfg, sampler_name, scheduler, warmup_at, refresh_every,
             mask_source, map_threshold, bound_strength, self_attn_jail,
-            jail_strength, subject_word, vae=None):
+            jail_strength, subject_word, divider="watershed", vae=None):
         import comfy.sample
 
         _check_sdxl(model)
@@ -1364,8 +1408,16 @@ class UnblendDynamicSampler:
                             state.ema, heads, H, W, pil.width, pil.height)
                         if len(assign) >= 2:
                             order = sorted(assign)
-                            vmasks = voronoi_char_masks(
-                                fg, [heads[assign[ci]] for ci in order], H, W)
+                            sel = [heads[assign[ci]] for ci in order]
+                            if divider == "watershed":
+                                try:
+                                    vmasks = watershed_char_masks(
+                                        pil, fg, sel, H, W)
+                                except Exception as e:
+                                    _log(done, f"watershed упал ({e}) -> Вороной")
+                                    vmasks = voronoi_char_masks(fg, sel, H, W)
+                            else:
+                                vmasks = voronoi_char_masks(fg, sel, H, W)
                             fr = [float(vmasks[i].mean())
                                   for i in range(vmasks.shape[0])]
                             if min(fr) < 0.03:

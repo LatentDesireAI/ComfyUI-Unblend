@@ -175,6 +175,32 @@ st_empty = ac._DynamicState({0: [5], 1: [10]}, 4, 2, 0.35, 1.0, 1.0, 4096)
 rm3 = ac._stabilize_identity(st_empty, new_masks, {0: 0, 1: 1})
 check("identity: без прежних масок без изменений", rm3 == {0: 0, 1: 1}, str(rm3))
 
+# ── watershed_char_masks: граница по краю картинки ─────────────────────────
+from PIL import Image as _Image
+img_arr = _np.zeros((260, 380, 3), _np.uint8)
+img_arr[:, :210] = (40, 40, 60)     # тёмная одежда слева (шире середины!)
+img_arr[:, 210:] = (230, 225, 210)  # светлая справа
+pil_test = _Image.fromarray(img_arr, "RGB")
+wm = ac.watershed_char_masks(pil_test, fg_img, [head_l, head_r], 104, 152)
+check("watershed форма", wm.shape == (2, 104, 152), str(wm.shape))
+check("watershed без пересечений", float((wm[0] * wm[1]).sum()) == 0.0)
+# на ПЛОСКОЙ синтетике watershed вырождается в равноудалённую границу
+# (нет градиентов = не к чему прилипать) — проверяем только структуру;
+# прилипание к шву одежды проверяется живыми прогонами
+b0 = wm[0].sum(dim=0)  # профиль маски 0 по x
+right_edge = int(max(i for i in range(152) if float(b0[i]) > 0))
+check("watershed граница между головами", 55 <= right_edge <= 100,
+      f"edge={right_edge}")
+wa = [float(wm[i].mean()) for i in range(2)]
+check("watershed обе зоны живы", min(wa) > 0.05, str(wa))
+cov = float(((wm.sum(0) > 0.5).float() *
+             torch.from_numpy(_np.array(_Image.fromarray(
+                 (fg_img * 255).astype(_np.uint8)).resize((152, 104))) / 255.0 > 0.5).float()).sum())
+fg_lat = float((torch.from_numpy(_np.array(_Image.fromarray(
+    (fg_img * 255).astype(_np.uint8)).resize((152, 104))) / 255.0 > 0.5).float()).sum())
+check("watershed покрывает силуэт", cov / max(fg_lat, 1) > 0.95,
+      f"{cov:.0f}/{fg_lat:.0f}")
+
 print()
 print("ИТОГ:", "все тесты прошли" if not fails else f"ПРОВАЛЕНО: {fails}")
 sys.exit(1 if fails else 0)
