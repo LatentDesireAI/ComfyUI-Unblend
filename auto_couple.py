@@ -1225,8 +1225,19 @@ def watershed_char_masks(pil, fg, head_boxes, latent_h, latent_w):
     markers = np.zeros((h, w), np.int32)
     markers[fg_np == 0] = n_c + 1   # фон не даёт зонам выползать за силуэт
     seed_r = max(3, int(0.012 * min(h, w)))
+    # тела рядом (а не друг над другом)? тогда якорим каждую заливку
+    # вертикальной линией вниз от головы — тело принадлежит своей голове
+    side_by_side = (n_c == 2 and
+                    abs(centers[0][0] - centers[1][0]) >=
+                    abs(centers[0][1] - centers[1][1]))
     for i, (cx, cy) in enumerate(centers):
         cv2.circle(markers, (int(cx), int(cy)), seed_r, i + 1, -1)
+        if side_by_side:
+            line = np.zeros((h, w), np.uint8)
+            cv2.line(line, (int(cx), int(cy)), (int(cx), h - 1), 1,
+                     thickness=max(2, seed_r // 2))
+            line &= (fg_np > 0.5).astype(np.uint8)
+            markers[line > 0] = i + 1
     img3 = np.ascontiguousarray(np.array(pil)[:, :, ::-1])  # RGB -> BGR
     cv2.watershed(img3, markers)
 
@@ -1256,7 +1267,17 @@ def straight_divider_masks(centers, latent_h, latent_w):
     """
     (ax, ay), (bx, by) = centers
     yy, xx = np.mgrid[0:latent_h, 0:latent_w]
-    side = (xx - (ax + bx) / 2.0) * (bx - ax) + (yy - (ay + by) / 2.0) * (by - ay)
+    # ВАЖНО: граница только вертикальная или горизонтальная. При поцелуе
+    # головы стоят по диагонали, но тела — рядом; диагональный перпендикуляр
+    # отдаёт корпус одного персонажа в зону другого (одежда свапается).
+    if abs(bx - ax) >= abs(by - ay):
+        side = xx - (ax + bx) / 2.0          # тела рядом -> вертикальная
+        if ax > bx:
+            side = -side
+    else:
+        side = yy - (ay + by) / 2.0          # друг над другом -> горизонтальная
+        if ay > by:
+            side = -side
     m0 = torch.from_numpy((side <= 0).astype(np.float32))
     return torch.stack([m0, 1.0 - m0])
 
@@ -1270,6 +1291,29 @@ def ema_peaks_latent(ema, keys, latent_h, latent_w):
         py, px = np.unravel_index(int(np.argmax(m)), (h, w))
         peaks.append(((px + 0.5) * latent_w / w, (py + 0.5) * latent_h / h))
     return peaks
+
+
+def column_voronoi_masks(fg, head_boxes, latent_h, latent_w):
+    """Вертикальные колонны по X голов внутри силуэта (тела рядом).
+
+    Запасной дивайдер, когда watershed перекосило: каждый пиксель силуэта —
+    голове с ближайшим X. Сбалансировано и не режет по диагонали.
+    """
+    import cv2
+    fg_np = np.asarray(fg).astype(np.float32)
+    if fg_np.ndim == 3:
+        fg_np = fg_np[..., 0]
+    h, w = fg_np.shape
+    cxs = [(b[0] + b[2]) / 2.0 for b in head_boxes]
+    xx = np.arange(w, dtype=np.float32).reshape(1, w)
+    owner_x = np.argmin(np.stack([np.abs(xx - cx) for cx in cxs]), axis=0)
+    owner = np.repeat(owner_x, h, axis=0)  # (h, w)
+    masks = []
+    for i in range(len(cxs)):
+        m = ((owner == i) & (fg_np > 0.5)).astype(np.float32)
+        m = cv2.resize(m, (latent_w, latent_h), interpolation=cv2.INTER_LINEAR)
+        masks.append(torch.from_numpy((m > 0.5).astype(np.float32)))
+    return torch.stack(masks)
 
 
 def _stabilize_identity(state, new_masks, rows_map):
@@ -1558,6 +1602,14 @@ class UnblendDynamicSampler:
                                            f"{[f'{a*100:.0f}%' for a in fr]} — "
                                            f"не обновляю")
                                 return
+                            if max(fr) / max(min(fr), 1e-9) > 3.5:
+                                # watershed утёк (нет краёв внизу кадра и
+                                # т.п.) — честные колонны по X голов
+                                vmasks = column_voronoi_masks(fg, sel, H, W)
+                                fr = [float(vmasks[i].mean())
+                                      for i in range(vmasks.shape[0])]
+                                _log(done, "watershed перекошен -> колонны "
+                                           "по X голов")
                             rows_map = {ci: r for r, ci in enumerate(order)}
                             rows_map = _stabilize_identity(state, vmasks, rows_map)
                             state.set_masks(vmasks, rows_map)

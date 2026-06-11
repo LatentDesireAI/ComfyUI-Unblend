@@ -198,6 +198,19 @@ sd2 = ac.straight_divider_masks([(76.0, 20.0), (76.0, 84.0)], 104, 152)
 check("line: горизонтальная граница", float(sd2[0][:45, :].mean()) == 1.0
       and float(sd2[1][60:, :].mean()) == 1.0)
 
+# диагональные пики -> граница всё равно осевая (вертикальная)
+sd3 = ac.straight_divider_masks([(30.0, 20.0), (120.0, 80.0)], 104, 152)
+col_vals = set(float(v) for v in sd3[0].sum(dim=0))
+check("line: диагональ -> вертикаль", col_vals <= {0.0, 104.0},
+      str(sorted(col_vals))[:40])
+
+# ── column_voronoi_masks: колонны по X голов ───────────────────────────────
+cvm = ac.column_voronoi_masks(fg_img, [head_l, head_r], 104, 152)
+check("columns: форма", cvm.shape == (2, 104, 152))
+ca = [float(cvm[i].mean()) for i in range(2)]
+check("columns: баланс", max(ca) / max(min(ca), 1e-9) < 1.5, str(ca))
+check("columns: левый не лезет вправо", float(cvm[0][:, 90:].sum()) == 0.0)
+
 # ── ema_peaks_latent ───────────────────────────────────────────────────────
 pm = {0: _np.zeros((26, 38), _np.float32), 1: _np.zeros((26, 38), _np.float32)}
 pm[0][6, 9] = 1.0   # пик слева-сверху
