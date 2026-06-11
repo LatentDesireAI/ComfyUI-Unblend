@@ -114,13 +114,20 @@ def activation_hw(seq_len, latent_h, latent_w):
 
 
 def build_masks_from_maps(char_maps, latent_h, latent_w, map_threshold=0.35,
-                          min_area_frac=0.02, fg=None):
+                          min_area_frac=0.02, fg=None, smooth=2, peak_min=2.0):
     """Накопленные attn-карты -> жёсткие взаимоисключающие маски.
 
-    char_maps: список (H?, W?) тензоров/массивов (у каждого персонажа своя),
-               уже в латентном разрешении НЕ обязаны быть — апсемплим тут.
-    fg:        опционально (latent_h, latent_w) маска силуэта 0/1 — карты
-               умножаются на неё (уточнение «hybrid»).
+    Алгоритм:
+      1. апсемпл до латента + сглаживание (box-blur);
+      2. отбраковка нелокализованных карт по «пиковости» max/mean < peak_min
+         (равномерная/размазанная карта = персонаж не локализовался);
+      3. каждая принятая карта шкалируется СВОИМ максимумом — персонажи
+         соревнуются на равных (первый в промпте обычно собирает больше
+         внимания и иначе затапливает кадр);
+      4. пиксель -> победитель argmax, если его шкалированное значение
+         > map_threshold, иначе фон.
+
+    fg: опционально (latent_h, latent_w) маска силуэта 0/1 — уточнение.
     Возвращает (masks (n, H, W) float32 torch, background (H, W), ok_flags).
     """
     n = len(char_maps)
@@ -132,11 +139,21 @@ def build_masks_from_maps(char_maps, latent_h, latent_w, map_threshold=0.35,
                           align_corners=False)[0, 0]
         ups.append(t)
     stack = torch.stack(ups)  # (n, H, W)
-    # ВАЖНО: нормируем ОБЩИМ максимумом, не каждым своим — иначе слабая
-    # «размазанная» карта (персонаж не локализовался) затопит весь кадр.
-    gmax = float(stack.max())
-    if gmax > 0:
-        stack = stack / gmax
+    if smooth > 0:
+        stack = feather_masks(stack / stack.max().clamp(min=1e-12), smooth)
+
+    # пиковость: насколько карта локализована
+    flat = stack.view(n, -1)
+    peaked = (flat.max(dim=1).values /
+              flat.mean(dim=1).clamp(min=1e-12)) >= peak_min
+
+    # шкала своим максимумом (только принятые карты участвуют в борьбе)
+    scaled = torch.zeros_like(stack)
+    for i in range(n):
+        if peaked[i]:
+            mx = float(stack[i].max())
+            if mx > 0:
+                scaled[i] = stack[i] / mx
 
     if fg is not None:
         fg_t = torch.as_tensor(fg, dtype=torch.float32)
@@ -144,17 +161,18 @@ def build_masks_from_maps(char_maps, latent_h, latent_w, map_threshold=0.35,
             fg_t = F.interpolate(fg_t.view(1, 1, *fg_t.shape),
                                  size=(latent_h, latent_w), mode="bilinear",
                                  align_corners=False)[0, 0]
-        stack = stack * (fg_t > 0.5).float()
+        scaled = scaled * (fg_t > 0.5).float()
 
-    best_val, best_idx = stack.max(dim=0)
-    masks = torch.zeros_like(stack)
+    best_val, best_idx = scaled.max(dim=0)
+    masks = torch.zeros_like(scaled)
     for i in range(n):
         masks[i] = ((best_idx == i) & (best_val > map_threshold)).float()
 
     ok = []
     total = latent_h * latent_w
     for i in range(n):
-        ok.append(bool(masks[i].sum().item() >= min_area_frac * total))
+        ok.append(bool(peaked[i].item())
+                  and bool(masks[i].sum().item() >= min_area_frac * total))
 
     background = (masks.sum(dim=0) < 0.5).float()
     return masks, background, ok
@@ -391,6 +409,7 @@ class _Harvester:
         self.acc = {}     # char_idx -> (h, w) np.float32 (в координатах карты)
         self.acc_hw = {}  # char_idx -> (h, w)
         self.latent_hw = None
+        self.cur_weight = 1.0  # вес шага (поздние шаги чётче — весят больше)
 
     def patch(self):
         from comfy.ldm.modules.attention import optimized_attention
@@ -439,7 +458,7 @@ class _Harvester:
                     continue
                 # mean по токенам спана: длина описания не должна давать фору
                 m = probs[..., idx].mean(dim=-1).mean(dim=0)  # (seq_q,)
-                m = m.view(h, w).float().cpu().numpy()
+                m = m.view(h, w).float().cpu().numpy() * self.cur_weight
                 if ci in self.acc and self.acc_hw[ci] == (h, w):
                     self.acc[ci] += m
                 else:
@@ -452,20 +471,44 @@ class _Harvester:
                     self.acc_hw[ci] = (h, w)
 
 
+def distinctive_positions(spans, needles):
+    """Оставить в спанах только различительные токены.
+
+    Токены, встречающиеся у НЕСКОЛЬКИХ персонажей ('(genshin impact)', 'hair',
+    запятые), собирают внимание на обе фигуры и размазывают карты. Оставляем
+    уникальные для персонажа ('columbina', 'black', 'blonde', 'eyepatch').
+    Фильтр применяется, только если спан совпал с needle по длине и после
+    фильтра остаётся >= 2 токенов.
+    """
+    out = {}
+    for i, span in spans.items():
+        needle = needles.get(i)
+        if not span or not needle or len(span) != len(needle):
+            out[i] = span
+            continue
+        others = set()
+        for j, nd in needles.items():
+            if j != i and nd:
+                others.update(nd)
+        keep = [p for p, tok in zip(span, needle) if tok not in others]
+        out[i] = keep if len(keep) >= 2 else span
+    return out
+
+
 def find_char_spans(clip, draw_text, char_texts):
     """Позиции токенов каждого CHARn внутри токенизированного draw-промпта."""
     toks = clip.tokenize(draw_text)
     key = "g" if "g" in toks else ("l" if "l" in toks else next(iter(toks)))
     hay = flatten_token_ids(toks[key])
-    spans = {}
+    spans, needles = {}, {}
     for i, ct in enumerate(char_texts):
         if not ct:
-            spans[i] = None
+            spans[i], needles[i] = None, None
             continue
         sub = clip.tokenize(ct)
-        needle = strip_specials(flatten_token_ids(sub[key]))
-        spans[i] = find_subsequence(hay, needle)
-    return spans
+        needles[i] = strip_specials(flatten_token_ids(sub[key]))
+        spans[i] = find_subsequence(hay, needles[i])
+    return distinctive_positions(spans, needles)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -619,6 +662,24 @@ class UnblendBoundedSampler:
             disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed)
 
     @staticmethod
+    def _heatmap_preview(maps, latent_h, latent_w, scale=6):
+        """Сырые attn-карты как теплокарта (для отладки при фолбэке)."""
+        palette = [(255, 80, 80), (80, 160, 255), (80, 255, 120), (255, 220, 80)]
+        canvas = torch.zeros(latent_h, latent_w, 3)
+        for i, m in enumerate(maps):
+            t = torch.as_tensor(m, dtype=torch.float32)
+            t = F.interpolate(t.view(1, 1, *t.shape), size=(latent_h, latent_w),
+                              mode="bilinear", align_corners=False)[0, 0]
+            mx = float(t.max())
+            if mx > 0:
+                t = t / mx
+            for c in range(3):
+                canvas[..., c] += t * (palette[i % 4][c] / 255.0)
+        canvas = canvas.clamp(0, 1).permute(2, 0, 1).unsqueeze(0)
+        canvas = F.interpolate(canvas, scale_factor=scale, mode="nearest")
+        return canvas.permute(0, 2, 3, 1)
+
+    @staticmethod
     def _mask_preview(masks, background, scale=6):
         palette = [(255, 80, 80), (80, 160, 255), (80, 255, 120), (255, 220, 80)]
         n, H, W = masks.shape
@@ -715,6 +776,9 @@ class UnblendBoundedSampler:
 
         def grab_x0(step, x0, x, total_steps):
             x0_holder["x0"] = x0
+            if harvester is not None:
+                # поздние шаги чётче — их карты весят больше
+                harvester.cur_weight = float(step + 1)
 
         noise = comfy.sample.prepare_noise(latent, seed, None)
         mid = self._sample(m1, noise, steps, cfg, sampler_name, scheduler,
@@ -774,11 +838,19 @@ class UnblendBoundedSampler:
                                  jail_strength=jail_strength)
             positive2 = base_cond
             info.append("фаза 2: couple" + (" + jail" if self_attn_jail else ""))
+            preview = self._mask_preview(masks, background)
         else:
             m2, positive2 = model, draw_cond
             masks = torch.zeros(1, H, W)
             background = torch.ones(H, W)
             info.append("фаза 2: без патчей (фолбэк)")
+            if harvester is not None and harvester.acc:
+                keys = sorted(harvester.acc.keys())
+                preview = self._heatmap_preview(
+                    [harvester.acc[i] for i in keys], H, W)
+                info.append("превью: СЫРЫЕ attn-карты (маски не собрались)")
+            else:
+                preview = self._mask_preview(masks, background)
 
         out = self._sample(m2, torch.zeros_like(noise), steps, cfg,
                            sampler_name, scheduler, positive2, neg_cond, mid,
@@ -786,8 +858,9 @@ class UnblendBoundedSampler:
                            force_full_denoise=True, disable_noise=True,
                            seed=seed)
 
-        preview = self._mask_preview(masks, background)
-        return ({"samples": out}, masks, preview, " | ".join(info))
+        info_str = " | ".join(info)
+        print(f"[UnblendBounded] {info_str}")
+        return ({"samples": out}, masks, preview, info_str)
 
 
 NODE_CLASS_MAPPINGS = {

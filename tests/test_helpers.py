@@ -63,6 +63,25 @@ check("слабая карта отсечена", ok2 == [True, False], str(ok2)
 check("реальная маска не пострадала", float(m2[0].sum()) > 100,
       f"area={float(m2[0].sum()):.0f}")
 
+# 4b. размазанная-но-пиковая доминирующая карта не топит компактную
+#     (случай «первый персонаж собирает внимание на обе фигуры»)
+broad = (np.exp(-(((xx - 19) ** 2) / 150 + ((yy - 13) ** 2) / 100)) * 5).astype(np.float32)
+tight = np.exp(-(((xx - 30) ** 2) / 8 + ((yy - 13) ** 2) / 16)).astype(np.float32)
+mb, _, okb = ac.build_masks_from_maps([broad, tight], 104, 152)
+cy, cx = int(13 / 26 * 104), int(30 / 38 * 152)
+check("компактная держит ядро", float(mb[1][cy, cx]) == 1.0)
+check("обе карты ok", okb == [True, True], str(okb))
+
+# 4c. distinctive_positions: общие токены персонажей выкидываются из спанов
+spans_t = {0: [10, 11, 12, 13], 1: [20, 21, 22, 23]}
+needles_t = {0: [5, 100, 101, 7], 1: [6, 200, 201, 7]}  # 7 — общий
+d = ac.distinctive_positions(spans_t, needles_t)
+check("distinctive: общий удалён", d[0] == [10, 11, 12] and d[1] == [20, 21, 22], str(d))
+needles_p = {0: [7, 8, 100], 1: [7, 8, 200]}
+spans_p = {0: [1, 2, 3], 1: [4, 5, 6]}
+d2 = ac.distinctive_positions(spans_p, needles_p)
+check("distinctive: < 2 уникальных -> исходный спан", d2[0] == [1, 2, 3], str(d2))
+
 # 5. jail_bias
 lab = torch.tensor([0, 1, 1, 2])
 b = ac.jail_bias(lab, strength=1.0)
