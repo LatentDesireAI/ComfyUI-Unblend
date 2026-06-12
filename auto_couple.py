@@ -1136,16 +1136,22 @@ class _DynamicState:
                               mode="bilinear", align_corners=False)
             m = m.squeeze(1).reshape(self.masks.shape[0], -1)[:, :seq_q]
             bias = torch.zeros(seq_q, seq_k, dtype=torch.float32)
-            # мягкие маски (init-зоны, линия по пикам) — подталкивание (-4),
-            # тела могут пересекать границу. Жёсткие (контуры тел) — стена.
+            # мягкие маски (init-зоны, колонны по пикам) — подталкивание (-4)
+            # + ДОПЛАТА (+2) своим токенам в своей зоне: персонаж активно
+            # материализуется в своей колонне (лечит «третий на фоне»).
+            # Жёсткие маски (контуры тел) — стена, без доплаты.
             val = (-4.0 if self.masks_soft else -10000.0) * float(self.bound_strength)
+            boost = 2.0 * float(self.bound_strength) if self.masks_soft else 0.0
             for ci, row in self.char_rows.items():
                 span = [p for p in (self.bias_spans.get(ci) or []) if p < seq_k]
                 if not span:
                     continue
+                span_t = torch.tensor(span)
                 outside = m[row] < 0.5            # (seq_q,)
-                bias[outside.nonzero(as_tuple=True)[0][:, None],
-                     torch.tensor(span)] = val
+                bias[outside.nonzero(as_tuple=True)[0][:, None], span_t] = val
+                if boost:
+                    inside = ~outside
+                    bias[inside.nonzero(as_tuple=True)[0][:, None], span_t] = boost
             self._cross_cache[key] = bias.to(device, dtype=dtype)
         return self._cross_cache[key]
 
@@ -1293,6 +1299,33 @@ def straight_divider_masks(centers, latent_h, latent_w):
     return torch.stack([m0, 1.0 - m0])
 
 
+def axis_column_masks(peaks, latent_h, latent_w):
+    """N зон по осевым границам между пиками (для любого числа персонажей).
+
+    Ось делёжки — где пики разлетелись сильнее (X -> вертикальные колонны,
+    Y -> горизонтальные полосы); границы — посередине между соседями.
+    Строка i соответствует peaks[i] (порядку персонажей), не порядку вдоль оси.
+    """
+    xs = [p[0] for p in peaks]
+    ys = [p[1] for p in peaks]
+    horiz = (max(xs) - min(xs)) >= (max(ys) - min(ys))
+    coords = xs if horiz else ys
+    L = latent_w if horiz else latent_h
+    order = sorted(range(len(peaks)), key=lambda i: coords[i])
+    bounds = [0]
+    for k in range(len(order) - 1):
+        bounds.append(int(round((coords[order[k]] + coords[order[k + 1]]) / 2)))
+    bounds.append(L)
+    masks = torch.zeros(len(peaks), latent_h, latent_w)
+    for rank, i in enumerate(order):
+        a, b = bounds[rank], bounds[rank + 1]
+        if horiz:
+            masks[i, :, a:b] = 1.0
+        else:
+            masks[i, a:b, :] = 1.0
+    return masks
+
+
 def ema_peaks_latent(ema, keys, latent_h, latent_w):
     """Пики карт (где формируется каждый персонаж) в координатах латента."""
     peaks = []
@@ -1355,9 +1388,9 @@ def _stabilize_identity(state, new_masks, rows_map):
 
     Affinity пересчитывается каждый refresh независимо; если карты качнулись,
     личности могут перевернуться — bias перевернётся посреди генерации.
-    Прилипание по IoU с предыдущими масками (для 2 персонажей).
+    Жадное переназначение по IoU с предыдущими масками (любое число персонажей).
     """
-    if state.masks is None or len(rows_map) != 2:
+    if state.masks is None or len(rows_map) < 2:
         return rows_map
     cis = sorted(rows_map)
     if any(ci not in state.char_rows for ci in cis):
@@ -1369,12 +1402,18 @@ def _stabilize_identity(state, new_masks, rows_map):
         union = float(((a + b) > 0.5).float().sum())
         return inter / union if union > 0 else 0.0
 
-    direct = sum(iou(new_masks[rows_map[ci]], prev[ci]) for ci in cis)
-    swapped = (iou(new_masks[rows_map[cis[1]]], prev[cis[0]])
-               + iou(new_masks[rows_map[cis[0]]], prev[cis[1]]))
-    if swapped > direct + 1e-6:
-        return {cis[0]: rows_map[cis[1]], cis[1]: rows_map[cis[0]]}
-    return rows_map
+    rows = [rows_map[c] for c in cis]
+    pairs = [(iou(new_masks[r], prev[ci]), ci, r)
+             for ci in cis for r in rows]
+    pairs.sort(key=lambda t: -t[0])
+    used_c, used_r, out = set(), set(), {}
+    for v, ci, r in pairs:
+        if ci in used_c or r in used_r:
+            continue
+        out[ci] = r
+        used_c.add(ci)
+        used_r.add(r)
+    return out
 
 
 def _dyn_attn2_replace(state):
@@ -1622,10 +1661,13 @@ class UnblendDynamicSampler:
                     heads, hconf = detect_heads_backend(pil, 0.25, 0.45, None)
                     heads, hconf = _dedup_boxes(
                         heads, hconf, 0.05 * min(pil.size))
-                    if len(heads) >= 2:
+                    # переключаемся на головы только при ПОЛНОМ комплекте:
+                    # если найдено меньше голов, чем персонажей, кто-то
+                    # остался бы вообще без маски (= без ограничений)
+                    if len(heads) >= len(present):
                         assign = head_char_affinity(
                             state.ema, heads, H, W, pil.width, pil.height)
-                        if len(assign) >= 2:
+                        if len(assign) == len(present):
                             order = sorted(assign)
                             sel = [heads[assign[ci]] for ci in order]
                             if divider == "watershed":
@@ -1661,7 +1703,8 @@ class UnblendDynamicSampler:
                             _log(done, f"heads={len(heads)} -> heads+attn-id, "
                                        f"маски {[f'{a*100:.0f}%' for a in fr]}")
                             return
-                    _log(done, f"heads={len(heads)} (<2) -> attn-only")
+                    _log(done, f"heads={len(heads)} (<{len(present)}) "
+                               f"-> мягкие зоны")
                 except Exception as e:
                     _log(done, f"heads-режим упал ({e}) -> attn-only")
             else:
@@ -1672,55 +1715,32 @@ class UnblendDynamicSampler:
             if len(keys) < 2:
                 return
 
-            # ── 2 персонажа: «прямая линия между ними» по пикам карт ───────
-            # Пики надёжны рано (положение), контуры — нет. Мягкая зона
-            # по перпендикуляру между пиками, едет за персонажами.
-            if len(keys) == 2:
-                peaks = ema_peaks_latent(state.ema, keys, H, W)
-                (ax, ay), (bx, by) = peaks
-                dist = math.hypot(bx - ax, by - ay) / math.hypot(H, W)
-                if dist < 0.10:
-                    _log(done, f"пики слиплись (dist={dist:.2f}) — без обновления")
-                    return
-                lmasks = straight_divider_masks(peaks, H, W)
-                clipped = ""
-                if fg is not None:
-                    lmasks = clip_zones_by_fg(lmasks, fg)
-                    clipped = " (обрезаны силуэтом, фон -> base)"
-                rows_map = _stabilize_identity(
-                    state, lmasks, {keys[0]: 0, keys[1]: 1})
-                state.set_masks(lmasks, rows_map, soft=True)
-                state.last_mode = "peak-line (soft)"
-                _log(done, f"линия по пикам ({ax:.0f},{ay:.0f})-({bx:.0f},{by:.0f}), "
-                           f"мягкие зоны{clipped}")
+            # ── N персонажей: колонны по пикам карт ────────────────────────
+            # Пики надёжны рано (положение), контуры — нет. Осевые зоны
+            # между пиками, мягкие, едут за персонажами; каждый персонаж
+            # получает свою колонну (включая третьего/четвёртого).
+            peaks = ema_peaks_latent(state.ema, keys, H, W)
+            xs = [p[0] for p in peaks]
+            ys = [p[1] for p in peaks]
+            horiz = (max(xs) - min(xs)) >= (max(ys) - min(ys))
+            coords = sorted(xs if horiz else ys)
+            axis_len = W if horiz else H
+            min_gap = min(coords[k + 1] - coords[k]
+                          for k in range(len(coords) - 1))
+            if min_gap < 0.08 * axis_len:
+                _log(done, f"пики слиплись (gap={min_gap:.0f}) — без обновления")
                 return
-
-            # ── 3+ персонажа: старая конкуренция карт ──────────────────────
-            state.last_mode = "attn-only"
-            maps = [state.ema[k] for k in keys]
-            thr = float(map_threshold)
-            while True:
-                masks_all, _, ok = build_masks_from_maps(
-                    maps, H, W, map_threshold=thr, fg=fg)
-                good = [k for k, o in zip(keys, ok) if o]
-                if len(good) >= 2 or thr <= 0.16:
-                    break
-                thr = round(thr - 0.1, 2)
-            if len(good) < 2:
-                _log(done, "attn-only: карты слабые, маски не обновлены")
-                return
-            rows = [keys.index(g) for g in good]
-            masks_sel = masks_all[rows]
+            lmasks = axis_column_masks(peaks, H, W)
+            clipped = ""
             if fg is not None:
-                masks_sel = fill_silhouette(masks_sel, fg)
-            fr = [float(masks_sel[i].mean()) for i in range(masks_sel.shape[0])]
-            if min(fr) < 0.05 or max(fr) / max(min(fr), 1e-9) > 4.0:
-                _log(done, f"attn-only: дисбаланс {[f'{a*100:.0f}%' for a in fr]}"
-                           f" — маски не обновлены")
-                return
-            state.set_masks(masks_sel, {g: r for r, g in enumerate(good)},
-                            soft=True)
-            _log(done, f"attn-only (soft), маски {[f'{a*100:.0f}%' for a in fr]}")
+                lmasks = clip_zones_by_fg(lmasks, fg)
+                clipped = ", обрезаны силуэтом"
+            rows_map = _stabilize_identity(
+                state, lmasks, {k: j for j, k in enumerate(keys)})
+            state.set_masks(lmasks, rows_map, soft=True)
+            state.last_mode = f"peak-columns x{len(keys)} (soft)"
+            pk_str = " ".join(f"({x:.0f},{y:.0f})" for x, y in peaks)
+            _log(done, f"колонны по пикам {pk_str}, мягкие{clipped}")
 
         def cb(step, x0, x, total_steps):
             state.finalize_step()

@@ -193,6 +193,8 @@ st_soft.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1}, soft=True)
 bs = st_soft.cross_bias(SEQ, SEQ_K, "cpu", torch.float32)
 check("soft: bias = -4 (не стена)", float(bs[right_px, 5]) == -4.0,
       str(float(bs[right_px, 5])))
+check("soft: доплата +2 в своей зоне", float(bs[left_px, 5]) == 2.0,
+      str(float(bs[left_px, 5])))
 check("soft: jail выключен",
       st_soft.jail_bias_for_seq(SEQ, "cpu", torch.float32) is None)
 st_soft.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1}, soft=False)
@@ -221,6 +223,24 @@ check("columns: форма", cvm.shape == (2, 104, 152))
 ca = [float(cvm[i].mean()) for i in range(2)]
 check("columns: баланс", max(ca) / max(min(ca), 1e-9) < 1.5, str(ca))
 check("columns: левый не лезет вправо", float(cvm[0][:, 90:].sum()) == 0.0)
+
+# ── axis_column_masks: N персонажей, строки по порядку персонажей ──────────
+pk3 = [(76.0, 40.0), (20.0, 50.0), (130.0, 60.0)]  # char0 в ЦЕНТРЕ
+ac3 = ac.axis_column_masks(pk3, 104, 152)
+check("columns3: форма", ac3.shape == (3, 104, 152))
+check("columns3: char0 в центре", float(ac3[0][50, 76]) == 1.0
+      and float(ac3[0][50, 10]) == 0.0)
+check("columns3: char1 слева", float(ac3[1][50, 10]) == 1.0)
+check("columns3: char2 справа", float(ac3[2][50, 140]) == 1.0)
+check("columns3: покрытие без дыр", float((ac3.sum(0) - 1).abs().max()) == 0.0)
+
+# ── stabilize для 3: жадное IoU чинит ротацию строк ────────────────────────
+st3 = ac._DynamicState({0: [5], 1: [10], 2: [15]}, 4, 2, 0.35, 1.0, 1.0, 4096)
+st3.latent_hw = (104, 152)
+st3.set_masks(ac3, {0: 0, 1: 1, 2: 2})
+rot = torch.stack([ac3[1], ac3[2], ac3[0]])  # строки повернули
+rm3 = ac._stabilize_identity(st3, rot, {0: 0, 1: 1, 2: 2})
+check("stabilize3: ротация поймана", rm3 == {0: 2, 1: 0, 2: 1}, str(rm3))
 
 # ── clip_zones_by_fg: фон выпадает из зон ──────────────────────────────────
 halves = ac.straight_divider_masks([(30.0, 52.0), (120.0, 52.0)], 104, 152)
