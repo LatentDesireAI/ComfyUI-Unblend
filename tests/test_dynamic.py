@@ -201,6 +201,18 @@ st_soft.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1}, soft=False)
 check("hard: jail включается",
       st_soft.jail_bias_for_seq(SEQ, "cpu", torch.float32) is not None)
 
+# ── jail_on_soft: точки бок-о-бок -> jail активен и на мягких зонах ─────────
+st_js = ac._DynamicState({0: [5, 6], 1: [10, 11]}, 4, 2, 0.35, 1.0, 1.0, 4096)
+st_js.latent_hw = (H, W)
+st_js.jail_on_soft = True
+st_js.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1}, soft=True)
+check("jail_on_soft: jail на мягких включён",
+      st_js.jail_bias_for_seq(SEQ, "cpu", torch.float32) is not None)
+st_js.jail_strength = 0.0
+st_js._jail_cache.clear()
+check("jail_on_soft: jail_strength=0 всё равно None",
+      st_js.jail_bias_for_seq(SEQ, "cpu", torch.float32) is None)
+
 # ── straight_divider_masks: прямая линия между пиками ──────────────────────
 sd = ac.straight_divider_masks([(30.0, 52.0), (120.0, 52.0)], 104, 152)
 check("line: форма", sd.shape == (2, 104, 152))
@@ -290,6 +302,58 @@ fg_lat = float((torch.from_numpy(_np.array(_Image.fromarray(
     (fg_img * 255).astype(_np.uint8)).resize((152, 104))) / 255.0 > 0.5).float()).sum())
 check("watershed покрывает силуэт", cov / max(fg_lat, 1) > 0.95,
       f"{cov:.0f}/{fg_lat:.0f}")
+
+# ── reorder_masks_by_char: строки -> порядок персонажей ────────────────────
+rm_in = torch.stack([m2, m1])               # строка0=право, строка1=лево
+ordered = ac.reorder_masks_by_char(rm_in, {0: 1, 1: 0})  # CHAR1=строка1
+check("reorder: CHAR1 первым", torch.equal(ordered[0], m1)
+      and torch.equal(ordered[1], m2))
+ident = ac.reorder_masks_by_char(rm_in, {0: 0, 1: 1})
+check("reorder: прямой порядок не трогаем", torch.equal(ident, rm_in))
+check("reorder: пустой char_rows -> как есть",
+      torch.equal(ac.reorder_masks_by_char(rm_in, {}), rm_in))
+# 3 персонажа, строки повёрнуты
+mm = [torch.full((H, W), float(i)) for i in range(3)]
+rot3 = torch.stack([mm[2], mm[0], mm[1]])
+o3 = ac.reorder_masks_by_char(rot3, {0: 1, 1: 2, 2: 0})  # CHAR1=стр1,CHAR2=стр2,CHAR3=стр0
+check("reorder3: порядок персонажей", torch.equal(o3[0], mm[0])
+      and torch.equal(o3[1], mm[1]) and torch.equal(o3[2], mm[2]))
+
+# ── ремаскинг: личность головы по МАСКАМ 1-го прохода (не attn-карты) ───────
+# char_masks как опознание: маска char0 слева, char1 справа -> head_char_affinity
+# должен вернуть тот же порядок, что и с attn-картами
+mask_left = _np.zeros((lat_h, lat_w), _np.float32)
+mask_left[:, :lat_w // 2] = 1.0
+mask_right = _np.zeros((lat_h, lat_w), _np.float32)
+mask_right[:, lat_w // 2:] = 1.0
+aff_m = ac.head_char_affinity({0: mask_left, 1: mask_right},
+                              [head_l, head_r], lat_h, lat_w, img_w, img_h)
+check("ремаск: личность по маскам прямая", aff_m == {0: 0, 1: 1}, str(aff_m))
+aff_m2 = ac.head_char_affinity({0: mask_right, 1: mask_left},
+                               [head_l, head_r], lat_h, lat_w, img_w, img_h)
+check("ремаск: личность по маскам перестановка", aff_m2 == {0: 1, 1: 0}, str(aff_m2))
+
+# ── parse_char_points: текстовый ввод якорных точек ────────────────────────
+pp = ac.parse_char_points("0.25,0.5; 0.75,0.5", 2)
+check("points: парсинг двух", pp == [(0.25, 0.5), (0.75, 0.5)], str(pp))
+check("points: пусто -> None", ac.parse_char_points("", 2) is None)
+check("points: одна точка -> None", ac.parse_char_points("0.5,0.5", 2) is None)
+check("points: clamp 0..1",
+      ac.parse_char_points("1.5,-0.2; 0.5,0.5", 2) == [(1.0, 0.0), (0.5, 0.5)])
+ppad = ac.parse_char_points("0.2,0.3; 0.8,0.3", 3)
+check("points: добивка до N последней",
+      len(ppad) == 3 and ppad[2] == (0.8, 0.3), str(ppad))
+ptrunc = ac.parse_char_points("0.2,0.3; 0.5,0.5; 0.8,0.3", 2)
+check("points: отрезание лишних", len(ptrunc) == 2, str(ptrunc))
+
+# ── point_head_affinity: личность головы по ближайшей точке ─────────────────
+# head_l center≈(88,50)img -> (8.8,5)lat; head_r≈(291,50)img -> (29.1,5)lat
+pl = [(5.0, 13.0), (33.0, 13.0)]   # лево, право (в латенте)
+ph = ac.point_head_affinity(pl, [head_l, head_r], lat_h, lat_w, img_w, img_h)
+check("point affinity: прямой порядок", ph == {0: 0, 1: 1}, str(ph))
+ph2 = ac.point_head_affinity([(33.0, 13.0), (5.0, 13.0)],
+                             [head_l, head_r], lat_h, lat_w, img_w, img_h)
+check("point affinity: перестановка точек", ph2 == {0: 1, 1: 0}, str(ph2))
 
 print()
 print("ИТОГ:", "все тесты прошли" if not fails else f"ПРОВАЛЕНО: {fails}")

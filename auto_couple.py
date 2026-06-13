@@ -34,6 +34,7 @@ v1: SDXL/Illustrious и совместимые UNet-файнтюны. Anima (DiT
 """
 
 import math
+import re
 
 import numpy as np
 import torch
@@ -1074,6 +1075,9 @@ class _DynamicState:
         self.masks = None        # (rows, H, W) жёсткие
         self.masks_soft = False  # True = мягкое подталкивание (init/линия),
                                  # False = стена (контуры тел) + jail
+        self.jail_on_soft = False  # разрешить jail и на мягких зонах: только
+                                   # когда раздел вертикальный (точки бок-о-бок,
+                                   # линия НЕ режет тело) — иначе «монстры»
         self.char_rows = {}      # char_idx -> строка в masks
         self.mask_version = 0
         self.ema = {}            # char_idx -> np (h, w)
@@ -1156,9 +1160,11 @@ class _DynamicState:
         return self._cross_cache[key]
 
     def jail_bias_for_seq(self, seq_len, device, dtype):
-        # jail только с контурами тел: резать self-attn по прямой линии
-        # сквозь пересекающиеся тела = разорванная анатомия («монстры»)
-        if self.masks is None or self.jail_strength <= 0 or self.masks_soft:
+        # jail с контурами тел ИЛИ с мягкими зонами при вертикальном разделе
+        # (точки бок-о-бок): прямая линия сквозь пересекающиеся тела рвёт
+        # анатомию («монстры»), а вертикальная граница между соседями — нет.
+        if (self.masks is None or self.jail_strength <= 0
+                or (self.masks_soft and not self.jail_on_soft)):
             return None
         key = (seq_len, self.mask_version, str(device), dtype)
         if key not in self._jail_cache:
@@ -1196,6 +1202,56 @@ def head_char_affinity(ema_maps, head_boxes, latent_h, latent_w, img_w, img_h):
     scores.sort(reverse=True)
     used_c, used_h, out = set(), set(), {}
     for s, ci, hi in scores:
+        if ci in used_c or hi in used_h:
+            continue
+        out[ci] = hi
+        used_c.add(ci)
+        used_h.add(hi)
+    return out
+
+
+def parse_char_points(s, n_chars):
+    """'x,y; x,y' (норм. 0..1, по порядку CHAR1..N) -> [(x,y), ...] или None.
+
+    Разделитель пар — ';' или перевод строки; внутри пары — любые два числа.
+    Меньше точек, чем персонажей -> добиваем последней; больше -> отрезаем.
+    """
+    if not s or not s.strip():
+        return None
+    pts = []
+    for chunk in re.split(r"[;\n]", s.strip()):
+        nums = re.findall(r"[-+]?\d*\.?\d+", chunk)
+        if len(nums) >= 2:
+            x = min(1.0, max(0.0, float(nums[0])))
+            y = min(1.0, max(0.0, float(nums[1])))
+            pts.append((x, y))
+    if len(pts) < 2:
+        return None
+    pts = pts[:n_chars]
+    while len(pts) < n_chars:
+        pts.append(pts[-1])
+    return pts
+
+
+def point_head_affinity(points_latent, head_boxes, latent_h, latent_w,
+                        img_w, img_h):
+    """Кому принадлежит голова: {char_idx: head_idx} по ближайшей точке (греди).
+
+    points_latent — якоря пользователя в координатах ЛАТЕНТА (x, y). Замена
+    head_char_affinity, когда позиции заданы явно: детерминированно, без
+    зависимости от attn-карт (поэтому нет свапа/«близнецов»).
+    """
+    sx = latent_w / float(img_w)
+    sy = latent_h / float(img_h)
+    scores = []
+    for ci, (px, py) in enumerate(points_latent):
+        for hi, (x0, y0, x1, y1) in enumerate(head_boxes):
+            cx = (x0 + x1) / 2.0 * sx
+            cy = (y0 + y1) / 2.0 * sy
+            scores.append(((cx - px) ** 2 + (cy - py) ** 2, ci, hi))
+    scores.sort()
+    used_c, used_h, out = set(), set(), {}
+    for _d, ci, hi in scores:
         if ci in used_c or hi in used_h:
             continue
         out[ci] = hi
@@ -1416,6 +1472,19 @@ def _stabilize_identity(state, new_masks, rows_map):
     return out
 
 
+def reorder_masks_by_char(masks, char_rows):
+    """(rows, H, W) + char_rows {char_idx: row} -> (n_chars, H, W) в порядке char_idx.
+
+    Внутри state маски лежат в порядке строк (как их положил последний refresh),
+    а char_rows говорит, какая строка чей персонаж. Для выходного MASK-порта и
+    для ремаскинга нужен детерминированный порядок «строка i = CHARi+1».
+    """
+    if not char_rows:
+        return masks
+    order = sorted(char_rows)
+    return torch.stack([masks[char_rows[ci]] for ci in order])
+
+
 def _dyn_attn2_replace(state):
     """Attention с bias по маскам + харвест карт. Заменяет attn2."""
 
@@ -1529,6 +1598,17 @@ class UnblendDynamicSampler:
                 # "1,1" = колонки пополам (CHAR1 слева), "" = выкл.
                 # Детект позже заменит их реальными контурами тел.
                 "init_ratios": ("STRING", {"default": "1,1"}),
+                # ЯКОРНЫЕ ТОЧКИ (норм. 0..1, по порядку CHAR1; CHAR2; ...):
+                # "0.25,0.5; 0.75,0.5" = CHAR1 слева-центр, CHAR2 справа-центр.
+                # Заданы -> стартовые зоны и опознание голов идут ОТ ТОЧЕК
+                # (перебивает init_ratios). Пусто -> старая логика колонок.
+                "char_points": ("STRING", {"default": ""}),
+                # РАННИЙ JAIL: резать self-attn между персонажами уже на мягкой
+                # фазе (только для точек бок-о-бок, раздел вертикальный).
+                # СИЛЬНЕЕ давит утечку признаков, НО ОСЛАБЛЯЕТ взаимодействие
+                # (объятия/касания формируются именно cross-body self-attn).
+                # Для INTERACT-сцен держи ВЫКЛ; для раздельных портретов — ВКЛ.
+                "early_jail": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "vae": ("VAE",),
@@ -1553,7 +1633,7 @@ class UnblendDynamicSampler:
             steps, cfg, sampler_name, scheduler, warmup_at, refresh_every,
             mask_source, map_threshold, bound_strength, self_attn_jail,
             jail_strength, subject_word, divider="watershed",
-            init_ratios="1,1", vae=None):
+            init_ratios="1,1", char_points="", early_jail=False, vae=None):
         import comfy.sample
 
         _check_sdxl(model)
@@ -1588,12 +1668,39 @@ class UnblendDynamicSampler:
         info.append(f"персонажей: {len(present)}, warmup {warmup_steps}/{steps}, "
                     f"refresh каждые {refresh_every}")
 
+        # ── якорные точки пользователя (норм. 0..1 -> координаты латента) ──
+        points = parse_char_points(char_points, len(present))
+        points_latent = ([(x * W, y * H) for (x, y) in points]
+                         if points else None)
+        # ранний jail (опц.): резать self-attn между персонажами уже на мягкой
+        # фазе. Только для точек бок-о-бок (разлёт по X > Y -> раздел вертикаль-
+        # ный, линия идёт между телами). ВНИМАНИЕ: ослабляет взаимодействие —
+        # объятия/касания формируются ровно через cross-body self-attn, который
+        # это режет. По умолчанию ВЫКЛ, чтобы INTERACT-сцены не ломались.
+        if (early_jail and points_latent and self_attn_jail
+                and len(points_latent) >= 2):
+            pxs = [p[0] for p in points_latent]
+            pys = [p[1] for p in points_latent]
+            if (max(pxs) - min(pxs)) >= (max(pys) - min(pys)):
+                state.jail_on_soft = True
+                info.append("early_jail: jail на мягких зонах (точки бок-о-бок) "
+                            "— взаимодействие персонажей ослаблено")
+
         # ── стартовые зоны с шага 0 (Matrix-режим как у Regional Prompter) ──
         # Ранние шаги решают композицию и цвета одежды — детект в это время
         # слеп (силуэт/головы появляются к ~50-65% шагов). Жёсткие колонки
         # защищают критичную фазу; refresh позже заменит их контурами тел.
         init = (init_ratios or "").strip().lower()
-        if init and init not in ("none", "off", "0"):
+        if points_latent:
+            # осевые зоны вокруг точек (axis_column_masks сам выберет ось по
+            # разлёту точек; строка i = CHARi+1) -> персонаж стартует у точки
+            zmask = axis_column_masks(points_latent, H, W)
+            state.latent_hw = (H, W)
+            state.set_masks(zmask, {i: i for i in range(len(present))},
+                            soft=True)
+            state.last_mode = "init-points (soft)"
+            info.append(f"старт: точки {points} (мягкие зоны, перебили init_ratios)")
+        elif init and init not in ("none", "off", "0"):
             try:
                 rs = [float(x) for x in init.replace(";", ",").split(",")
                       if x.strip()]
@@ -1652,10 +1759,11 @@ class UnblendDynamicSampler:
                 except Exception as e:
                     print(f"[UnblendDynamic] силуэт не получился: {e}")
 
-            # ── приоритет: геометрия от голов, личность от карт ────────────
+            # ── приоритет: геометрия от голов, личность от карт ИЛИ ТОЧЕК ───
             # Детект голов даёт сбалансированные зоны по построению (никто
-            # не «доминирует»), attn-карты лишь опознают, какая голова чья.
-            if pil is not None and fg is not None and state.ema:
+            # не «доминирует»). Личность головы: по якорной точке (если задана,
+            # детерминированно) либо по attn-картам (иначе).
+            if pil is not None and fg is not None and (state.ema or points_latent):
                 try:
                     from .deepghs_nodes import detect_heads_backend, _dedup_boxes
                     heads, hconf = detect_heads_backend(pil, 0.25, 0.45, None)
@@ -1665,8 +1773,13 @@ class UnblendDynamicSampler:
                     # если найдено меньше голов, чем персонажей, кто-то
                     # остался бы вообще без маски (= без ограничений)
                     if len(heads) >= len(present):
-                        assign = head_char_affinity(
-                            state.ema, heads, H, W, pil.width, pil.height)
+                        if points_latent:
+                            assign = point_head_affinity(
+                                points_latent, heads, H, W,
+                                pil.width, pil.height)
+                        else:
+                            assign = head_char_affinity(
+                                state.ema, heads, H, W, pil.width, pil.height)
                         if len(assign) == len(present):
                             order = sorted(assign)
                             sel = [heads[assign[ci]] for ci in order]
@@ -1697,10 +1810,15 @@ class UnblendDynamicSampler:
                                 _log(done, "watershed перекошен -> колонны "
                                            "по X голов")
                             rows_map = {ci: r for r, ci in enumerate(order)}
-                            rows_map = _stabilize_identity(state, vmasks, rows_map)
+                            # точки = источник истины для личности; не давать
+                            # IoU-стабилизатору перекинуть строки против точек
+                            if not points_latent:
+                                rows_map = _stabilize_identity(
+                                    state, vmasks, rows_map)
                             state.set_masks(vmasks, rows_map)
-                            state.last_mode = "heads+attn-id"
-                            _log(done, f"heads={len(heads)} -> heads+attn-id, "
+                            id_src = "points" if points_latent else "attn"
+                            state.last_mode = f"heads+{id_src}-id"
+                            _log(done, f"heads={len(heads)} -> heads+{id_src}-id, "
                                        f"маски {[f'{a*100:.0f}%' for a in fr]}")
                             return
                     _log(done, f"heads={len(heads)} (<{len(present)}) "
@@ -1710,6 +1828,22 @@ class UnblendDynamicSampler:
             else:
                 _log(done, f"без силуэта (pil={pil is not None}, "
                            f"ema={len(state.ema)}) -> attn-only")
+
+            # ── точки заданы -> мягкие зоны держим на ТОЧКАХ, а не на пиках ─
+            # Иначе ранняя фаза едет за блуждающими attn-пиками (они слипаются
+            # у центра -> персонажи мешаются, признаки текут). Точки = якорь
+            # на весь warmup+soft, до появления жёстких контуров от голов.
+            if points_latent:
+                lmasks = axis_column_masks(points_latent, H, W)
+                clipped = ""
+                if fg is not None:
+                    lmasks = clip_zones_by_fg(lmasks, fg)
+                    clipped = ", обрезаны силуэтом"
+                state.set_masks(lmasks, {i: i for i in range(len(present))},
+                                soft=True)
+                state.last_mode = "point-columns (soft)"
+                _log(done, f"колонны по точкам, мягкие{clipped}")
+                return
 
             keys = sorted(state.ema.keys())
             if len(keys) < 2:
@@ -1774,7 +1908,11 @@ class UnblendDynamicSampler:
 
         info_str = " | ".join(info)
         print(f"[UnblendDynamic] {info_str}")
-        return ({"samples": out}, masks, preview, info_str,
+        # MASK-порт — в порядке персонажей (CHAR1, CHAR2, ...), чтобы Remask
+        # @ HiRes мог использовать их как опознание личности без путаницы строк.
+        masks_out = (reorder_masks_by_char(masks, state.char_rows)
+                     if state.masks is not None else masks)
+        return ({"samples": out}, masks_out, preview, info_str,
                 m, draw_cond, neg_cond)
 
     @staticmethod
@@ -1791,15 +1929,183 @@ class UnblendDynamicSampler:
             disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed)
 
 
+class UnblendRemaskHires:
+    """Пересобрать маски персонажей на hi-res кадре и перепатчить модель.
+
+    Ставится МЕЖДУ основным проходом и детейл/hires-проходом. Детект
+    силуэта+голов на уже апскейленном изображении даёт ТОЧНЫЕ границы по
+    лицам, а маски первого прохода (char_masks) служат только опознанием
+    «какая голова чья» — поэтому Фишл больше не получает маску глаз Колумбины.
+
+    Отдаёт перепатченную модель (couple+jail с hi-res масками) и draw/neg
+    кондишены — их надо подать в KSampler детейл-прохода (positive ОБЯЗАТЕЛЕН
+    как в Dynamic: bias привязан к позициям токенов draw).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "image": ("IMAGE",),
+                "char_masks": ("MASK",),
+                "prompt": ("STRING", {"multiline": True, "default":
+                    "[QUALITY] masterpiece, best quality\n"
+                    "[STYLE] anime style\n"
+                    "[SCENE] simple background\n"
+                    "[CHAR1] columbina (genshin impact), black hair, white dress\n"
+                    "[CHAR2] fischl (genshin impact), blonde hair, eyepatch\n"
+                    "[INTERACT] embracing, face to face"}),
+                "negative_prompt": ("STRING", {"multiline": True, "default":
+                    "lowres, worst quality, low quality, bad anatomy, bad hands"}),
+                "subject_word": ("STRING", {"default": "girl"}),
+                "divider": (["watershed", "nearest_center"],),
+                "bound_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "self_attn_jail": ("BOOLEAN", {"default": True}),
+                "jail_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "head_conf": ("FLOAT", {"default": 0.25, "min": 0.05, "max": 0.9, "step": 0.05}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING",
+                    "MASK", "IMAGE", "STRING")
+    RETURN_NAMES = ("model", "positive", "negative",
+                    "char_masks", "mask_preview", "info")
+    OUTPUT_TOOLTIPS = (
+        "пропатченная модель couple+jail с hi-res масками — в KSampler детейла",
+        "draw-кондишен (ОБЯЗАТЕЛЕН как positive детейл-KSampler'а)",
+        "негатив",
+        "новые маски персонажей (порядок CHAR1, CHAR2, ...)",
+        "превью масок", "лог")
+    FUNCTION = "run"
+    CATEGORY = "Unblend"
+
+    def run(self, model, clip, image, char_masks, prompt, negative_prompt,
+            subject_word="girl", divider="watershed", bound_strength=1.0,
+            self_attn_jail=True, jail_strength=1.0, head_conf=0.25):
+        from PIL import Image
+
+        _check_sdxl(model)
+        info = []
+
+        # ── промпт -> draw + спаны (как в Dynamic, тот же промпт) ───────────
+        sections = parse_prompt(prompt)
+        char_texts = [_clean(sections[f"char{i}"]) for i in range(1, 5)]
+        present = [c for c in char_texts if c]
+        if len(present) < 2:
+            raise ValueError("[UnblendRemask] нужно минимум 2 заполненных [CHARn]")
+        n = len(present)
+
+        draw, _, _ = build_blocks(
+            prompt, subject_word=(subject_word.strip() or "girl"))
+        draw_cond = UnblendBoundedSampler._encode(clip, draw)
+        neg_cond = UnblendBoundedSampler._encode(clip, negative_prompt)
+        bias_spans, _ = find_char_spans(clip, draw, present)
+        missing = [i + 1 for i, s in bias_spans.items() if not s]
+        if missing:
+            info.append(f"токены CHAR{missing} не найдены — без ограничений")
+
+        # ── изображение -> PIL + латентные размеры (латент = image/8) ───────
+        img_np = (np.clip(image[0].cpu().numpy(), 0, 1) * 255).astype(np.uint8)
+        pil = Image.fromarray(img_np, "RGB")
+        img_w, img_h = pil.size
+        H, W = img_h // 8, img_w // 8
+
+        # ── char_masks первого прохода: только опознание личности ──────────
+        cm = char_masks
+        if cm.dim() == 2:
+            cm = cm.unsqueeze(0)
+        cm = cm[:n].float()
+        ema_like = {i: cm[i].cpu().numpy() for i in range(cm.shape[0])}
+
+        # ── свежий детект на hi-res: точные границы по лицам/телам ──────────
+        result = None
+        try:
+            from .deepghs_nodes import (
+                silhouette_fg, detect_heads_backend, _dedup_boxes)
+            fg = silhouette_fg(pil)
+            heads, hconf = detect_heads_backend(pil, head_conf, 0.45, None)
+            heads, hconf = _dedup_boxes(heads, hconf, 0.05 * min(pil.size))
+            if len(heads) >= n and len(ema_like) == n:
+                # личность головы — по маскам 1-го прохода (а не по attn-картам)
+                assign = head_char_affinity(ema_like, heads, H, W, img_w, img_h)
+                if len(assign) == n:
+                    order = sorted(assign)
+                    sel = [heads[assign[ci]] for ci in order]
+                    if divider == "watershed":
+                        try:
+                            vmasks = watershed_char_masks(pil, fg, sel, H, W)
+                        except Exception as e:
+                            info.append(f"watershed упал ({e}) -> Вороной")
+                            vmasks = voronoi_char_masks(fg, sel, H, W)
+                    else:
+                        vmasks = voronoi_char_masks(fg, sel, H, W)
+                    fr = [float(vmasks[k].mean()) for k in range(vmasks.shape[0])]
+                    if min(fr) >= 0.02:
+                        rows_map = {ci: r for r, ci in enumerate(order)}
+                        result = (vmasks, rows_map)
+                        info.append(f"hi-res детект: heads={len(heads)}, "
+                                    f"маски {[f'{a*100:.0f}%' for a in fr]}")
+                    else:
+                        info.append(f"hi-res маски вырождены "
+                                    f"{[f'{a*100:.0f}%' for a in fr]} "
+                                    f"-> фолбэк на char_masks")
+                else:
+                    info.append("личности голов не сопоставились "
+                                "-> фолбэк на char_masks")
+            else:
+                info.append(f"heads={len(heads)} (<{n}) -> фолбэк на char_masks")
+        except Exception as e:
+            info.append(f"детект упал ({e}) -> фолбэк на char_masks")
+
+        # ── фолбэк: апскейл масок 1-го прохода (личность верна, край грубее) ─
+        if result is None:
+            up = F.interpolate(cm.unsqueeze(1), size=(H, W), mode="bilinear",
+                               align_corners=False).squeeze(1)
+            up = (up > 0.5).float()
+            result = (up, {i: i for i in range(up.shape[0])})
+
+        vmasks, rows_map = result
+
+        # ── state с замороженными hi-res масками (без refresh/харвеста) ─────
+        state = _DynamicState(
+            {}, refresh_every=10 ** 9, warmup_steps=0, map_threshold=0.35,
+            bound_strength=bound_strength, jail_strength=jail_strength,
+            jail_max_seq=4096, bias_spans=bias_spans)
+        state.latent_hw = (H, W)
+        state.set_masks(vmasks, rows_map, soft=False)
+
+        # ── патч модели: cross-bias на все attn2 + self-attn jail ───────────
+        m = model.clone()
+        patch2 = _dyn_attn2_replace(state)
+        for name, count in (("input", 12), ("middle", 1), ("output", 12)):
+            for number in range(count):
+                for t_idx in range(10):
+                    m.set_model_attn2_replace(patch2, name, number, t_idx)
+        if self_attn_jail:
+            _register_attn1_everywhere(m, _dyn_attn1_replace(state))
+
+        background = (vmasks.sum(dim=0) < 0.5).float()
+        preview = UnblendBoundedSampler._mask_preview(vmasks, background)
+        out_masks = reorder_masks_by_char(vmasks, rows_map)
+
+        info_str = " | ".join(info) if info else "ok"
+        print(f"[UnblendRemask] {info_str}")
+        return (m, draw_cond, neg_cond, out_masks, preview, info_str)
+
+
 NODE_CLASS_MAPPINGS = {
     "UnblendCoupleApply": UnblendCoupleApply,
     "UnblendZoneMasks": UnblendZoneMasks,
     "UnblendBoundedSampler": UnblendBoundedSampler,
     "UnblendDynamicSampler": UnblendDynamicSampler,
+    "UnblendRemaskHires": UnblendRemaskHires,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UnblendCoupleApply": "Unblend Couple Apply (SDXL + jail)",
     "UnblendZoneMasks": "Unblend Zone Masks (RP matrix)",
     "UnblendBoundedSampler": "Unblend Bounded Sampler (2-phase)",
     "UnblendDynamicSampler": "Unblend Dynamic Sampler (Bounded Attention)",
+    "UnblendRemaskHires": "Unblend Remask @ HiRes (detail pass)",
 }
