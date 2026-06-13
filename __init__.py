@@ -90,6 +90,16 @@ except Exception as e:
     print(f"[Unblend] sam2_nodes пропущен: {e}")
 
 try:
+    from .scene_nodes import (
+        NODE_CLASS_MAPPINGS as _scene_map,
+        NODE_DISPLAY_NAME_MAPPINGS as _scene_disp,
+    )
+    NODE_CLASS_MAPPINGS.update(_scene_map)
+    NODE_DISPLAY_NAME_MAPPINGS.update(_scene_disp)
+except Exception as e:
+    print(f"[Unblend] scene_nodes пропущен: {e}")
+
+try:
     from .pose_engine import (
         NODE_CLASS_MAPPINGS as _pose_map,
         NODE_DISPLAY_NAME_MAPPINGS as _pose_disp,
