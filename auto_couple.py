@@ -2217,6 +2217,14 @@ def sequential_char_prompt(sections, char_text, subject_word="girl"):
                   sections["body"], sections["scene"], sections["camera"]])
 
 
+def scene_prompt(sections):
+    """Промпт фона/общего арта: общий контекст БЕЗ персонажей и взаимодействия —
+    для прохода по зоне фона (детализация локации/света, не трогая героев).
+    """
+    return _join([sections["quality"], sections["style"],
+                  sections["scene"], sections["camera"]])
+
+
 class UnblendSequentialRefine:
     """По-персонажный масочный img2img: каждого добиваем ОТДЕЛЬНО его промптом.
 
@@ -2257,6 +2265,9 @@ class UnblendSequentialRefine:
                 # сила перерисовки региона: ниже = вернее держит позу,
                 # выше = сильнее чистит черты/одежду. 0.4-0.55 обычно.
                 "refine_denoise": ("FLOAT", {"default": 0.45, "min": 0.1, "max": 0.95, "step": 0.05}),
+                # проход по ФОНУ (инверсная зона, промпт сцены без персонажей):
+                # дотягивает детали локации/света, не трогая героев. 0 = выкл.
+                "background_denoise": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 0.8, "step": 0.05}),
                 # финальный проход без маски, чтобы сшить швы и свет. 0 = выкл.
                 "harmonize_denoise": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 0.6, "step": 0.02}),
                 "mask_feather": ("INT", {"default": 4, "min": 0, "max": 32}),
@@ -2271,7 +2282,8 @@ class UnblendSequentialRefine:
 
     def run(self, model, clip, vae, image, char_masks, prompt, negative_prompt,
             seed, steps, cfg, sampler_name, scheduler, refine_denoise=0.45,
-            harmonize_denoise=0.18, mask_feather=4, subject_word="girl"):
+            background_denoise=0.3, harmonize_denoise=0.18, mask_feather=4,
+            subject_word="girl"):
         import comfy.sample
         import comfy.utils
 
@@ -2323,6 +2335,25 @@ class UnblendSequentialRefine:
             done.append(i + 1)
 
         info.append(f"рефайн CHAR{done} @ denoise {refine_denoise}")
+
+        # ── проход по ФОНУ: инверсная зона + промпт сцены (без персонажей) ──
+        # детализирует локацию/свет, героев не трогает (они вне маски фона).
+        if background_denoise > 0:
+            bg = (1.0 - cm.clamp(0, 1).amax(dim=0)).clamp(0, 1)   # вне всех масок
+            bg = feather_masks(bg.unsqueeze(0), mask_feather)[0]
+            if float(bg.max()) >= 0.02:
+                pos_bg = UnblendBoundedSampler._encode(clip, scene_prompt(sections))
+                bg_lat = bg.view(1, 1, h_lat, w_lat)
+                noise = comfy.sample.prepare_noise(cur, seed + 777, None)
+                cur = comfy.sample.sample(
+                    model, noise, steps, cfg, sampler_name, scheduler,
+                    pos_bg, neg_cond, cur,
+                    denoise=background_denoise, disable_noise=False,
+                    start_step=None, last_step=None, force_full_denoise=False,
+                    noise_mask=bg_lat, callback=None,
+                    disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+                    seed=seed + 777)
+                info.append(f"фон @ denoise {background_denoise}")
 
         # ── финальный хармонайз без маски: сшить швы/свет ───────────────────
         if harmonize_denoise > 0:

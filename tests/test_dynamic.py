@@ -397,6 +397,15 @@ cp2 = ac.sequential_char_prompt(_secs, _secs["char2"], "girl")
 check("seq prompt: CHAR2 свой, без CHAR1",
       "fischl" in cp2 and "columbina" not in cp2 and "white dress" not in cp2)
 
+# ── scene_prompt: фон без персонажей и без interact ─────────────────────────
+scp = ac.scene_prompt(_secs)
+check("scene prompt: сцена/стиль/качество внутри",
+      all(w in scp for w in ["library", "cel shaded", "masterpiece", "soft light"]))
+check("scene prompt: персонажей НЕТ",
+      "columbina" not in scp and "fischl" not in scp and "white dress" not in scp)
+check("scene prompt: interact НЕТ", "spooning" not in scp and "hand on breast" not in scp)
+check("scene prompt: body НЕ тащим", "petite" not in scp)
+
 # ── assign_masks_by_points: разметка инстанс-масок SAM по точкам ───────────
 mA = torch.zeros(16, 16); mA[:, :8] = 1.0     # левый инстанс
 mB = torch.zeros(16, 16); mB[:, 8:] = 1.0     # правый инстанс
