@@ -213,6 +213,31 @@ st_js._jail_cache.clear()
 check("jail_on_soft: jail_strength=0 всё равно None",
       st_js.jail_bias_for_seq(SEQ, "cpu", torch.float32) is None)
 
+# ── identity_lock: буст СВОИХ distinctive-токенов внутри жёсткой маски ──────
+st_id = ac._DynamicState({0: [5], 1: [10]}, 4, 2, 0.35, 1.0, 1.0, 4096,
+                         bias_spans={0: [5, 6], 1: [10, 11]},
+                         identity_lock=1.5)
+st_id.latent_hw = (H, W)
+st_id.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1})  # hard
+bi = st_id.cross_bias(SEQ, SEQ_K, "cpu", torch.float32)
+check("id_lock: distinctive буст в своей зоне",
+      float(bi[left_px, 5]) == 1.5, str(float(bi[left_px, 5])))
+check("id_lock: distinctive стена в чужой",
+      float(bi[right_px, 5]) == -10000.0)
+check("id_lock: не-distinctive (6) в своей зоне без буста",
+      float(bi[left_px, 6]) == 0.0, str(float(bi[left_px, 6])))
+st_id.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1}, soft=True)
+bi2 = st_id.cross_bias(SEQ, SEQ_K, "cpu", torch.float32)
+check("id_lock: на мягких игнор (там свой boost +2)",
+      float(bi2[left_px, 5]) == 2.0, str(float(bi2[left_px, 5])))
+st_no = ac._DynamicState({0: [5], 1: [10]}, 4, 2, 0.35, 1.0, 1.0, 4096,
+                         bias_spans={0: [5, 6], 1: [10, 11]})  # lock=0 по умолч.
+st_no.latent_hw = (H, W)
+st_no.set_masks(torch.stack([m1, m2]), {0: 0, 1: 1})
+bn = st_no.cross_bias(SEQ, SEQ_K, "cpu", torch.float32)
+check("id_lock=0: своему токену 0 (нет буста)",
+      float(bn[left_px, 5]) == 0.0, str(float(bn[left_px, 5])))
+
 # ── straight_divider_masks: прямая линия между пиками ──────────────────────
 sd = ac.straight_divider_masks([(30.0, 52.0), (120.0, 52.0)], 104, 152)
 check("line: форма", sd.shape == (2, 104, 152))
@@ -354,6 +379,40 @@ check("point affinity: прямой порядок", ph == {0: 0, 1: 1}, str(ph)
 ph2 = ac.point_head_affinity([(33.0, 13.0), (5.0, 13.0)],
                              [head_l, head_r], lat_h, lat_w, img_w, img_h)
 check("point affinity: перестановка точек", ph2 == {0: 1, 1: 0}, str(ph2))
+
+# ── sequential_char_prompt: per-char промпт для рефайна ─────────────────────
+_secs = ac.parse_prompt(
+    "[QUALITY] masterpiece\n[STYLE] cel shaded\n[SCENE] library\n"
+    "[CAMERA] soft light\n[CHAR1] columbina, white dress\n"
+    "[CHAR2] fischl, blonde hair\n[BODY] petite\n[INTERACT] spooning, hand on breast")
+cp1 = ac.sequential_char_prompt(_secs, _secs["char1"], "girl")
+check("seq prompt: свой персонаж внутри", "columbina" in cp1 and "white dress" in cp1)
+check("seq prompt: общий контекст внутри",
+      all(w in cp1 for w in ["masterpiece", "cel shaded", "library", "soft light", "petite"]))
+check("seq prompt: счётчик 1girl", "1girl" in cp1)
+check("seq prompt: соседка НЕ попала", "fischl" not in cp1 and "blonde" not in cp1)
+check("seq prompt: interact НЕ попал",
+      "spooning" not in cp1 and "hand on breast" not in cp1)
+cp2 = ac.sequential_char_prompt(_secs, _secs["char2"], "girl")
+check("seq prompt: CHAR2 свой, без CHAR1",
+      "fischl" in cp2 and "columbina" not in cp2 and "white dress" not in cp2)
+
+# ── assign_masks_by_points: разметка инстанс-масок SAM по точкам ───────────
+mA = torch.zeros(16, 16); mA[:, :8] = 1.0     # левый инстанс
+mB = torch.zeros(16, 16); mB[:, 8:] = 1.0     # правый инстанс
+inst = torch.stack([mB, mA])                  # порядок намеренно перепутан
+# точки: CHAR1 слева (4,8), CHAR2 справа (12,8) в координатах маски 16x16
+asg = ac.assign_masks_by_points(inst, [(4.0, 8.0), (12.0, 8.0)])
+check("assign: CHAR1 -> левый инстанс", asg[0] == 1, str(asg))
+check("assign: CHAR2 -> правый инстанс", asg[1] == 0, str(asg))
+# окклюзия: большой передний инстанс + маленький задний внутри него;
+# точка переднего вне маленького -> containment решает верно
+front = torch.zeros(16, 16); front[2:14, 2:14] = 1.0
+back = torch.zeros(16, 16); back[3:6, 3:6] = 1.0   # огрызок «заднего»
+inst2 = torch.stack([front, back])
+# CHAR1 = задний (точка в огрызке 4,4), CHAR2 = передний (точка в теле 11,11)
+asg2 = ac.assign_masks_by_points(inst2, [(4.0, 4.0), (11.0, 11.0)])
+check("assign: окклюзия по containment", asg2[0] == 1 and asg2[1] == 0, str(asg2))
 
 print()
 print("ИТОГ:", "все тесты прошли" if not fails else f"ПРОВАЛЕНО: {fails}")

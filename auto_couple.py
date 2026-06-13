@@ -40,7 +40,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .prompt_builder import build_blocks, parse_prompt, _clean
+from .prompt_builder import build_blocks, parse_prompt, _clean, _join
 
 _CLIP_START = 49406
 _CLIP_END = 49407
@@ -1057,8 +1057,9 @@ class _DynamicState:
 
     def __init__(self, spans, refresh_every, warmup_steps, map_threshold,
                  bound_strength, jail_strength, jail_max_seq,
-                 harvest_max_seq=1100, ema_keep=0.6, bias_spans=None):
-        # spans — различительные токены (харвест карт);
+                 harvest_max_seq=1100, ema_keep=0.6, bias_spans=None,
+                 identity_lock=0.0):
+        # spans — различительные токены (харвест карт + лок личности);
         # bias_spans — ПОЛНЫЕ позиции чанков (ограничение внимания)
         self.spans = {i: s for i, s in spans.items() if s}
         self.bias_spans = {i: s for i, s in (bias_spans or spans).items() if s}
@@ -1070,6 +1071,9 @@ class _DynamicState:
         self.jail_max_seq = jail_max_seq
         self.harvest_max_seq = harvest_max_seq
         self.ema_keep = ema_keep
+        # лок личности: доплата СВОИМ distinctive-токенам внутри жёсткой маски
+        # (мягкие зоны уже имеют свой boost). 0 = выкл.
+        self.identity_lock = identity_lock
 
         self.latent_hw = None
         self.masks = None        # (rows, H, W) жёсткие
@@ -1146,16 +1150,27 @@ class _DynamicState:
             # Жёсткие маски (контуры тел) — стена, без доплаты.
             val = (-4.0 if self.masks_soft else -10000.0) * float(self.bound_strength)
             boost = 2.0 * float(self.bound_strength) if self.masks_soft else 0.0
+            # лок личности: на ЖЁСТКИХ масках доплачиваем СВОИМ distinctive-
+            # токенам внутри зоны (не всему чанку — чтобы не перекосить генерик).
+            # Персонаж плотнее «материализуется» -> чище разделение лиц/черт.
+            id_boost = (float(self.identity_lock) * float(self.bound_strength)
+                        if not self.masks_soft else 0.0)
             for ci, row in self.char_rows.items():
                 span = [p for p in (self.bias_spans.get(ci) or []) if p < seq_k]
-                if not span:
-                    continue
-                span_t = torch.tensor(span)
-                outside = m[row] < 0.5            # (seq_q,)
-                bias[outside.nonzero(as_tuple=True)[0][:, None], span_t] = val
-                if boost:
-                    inside = ~outside
-                    bias[inside.nonzero(as_tuple=True)[0][:, None], span_t] = boost
+                if span:
+                    span_t = torch.tensor(span)
+                    outside = m[row] < 0.5            # (seq_q,)
+                    bias[outside.nonzero(as_tuple=True)[0][:, None], span_t] = val
+                    if boost:
+                        inside = ~outside
+                        bias[inside.nonzero(as_tuple=True)[0][:, None], span_t] = boost
+                if id_boost:
+                    dspan = [p for p in (self.spans.get(ci) or []) if p < seq_k]
+                    if dspan:
+                        dspan_t = torch.tensor(dspan)
+                        inside = m[row] >= 0.5
+                        bias[inside.nonzero(as_tuple=True)[0][:, None],
+                             dspan_t] = id_boost
             self._cross_cache[key] = bias.to(device, dtype=dtype)
         return self._cross_cache[key]
 
@@ -1257,6 +1272,43 @@ def point_head_affinity(points_latent, head_boxes, latent_h, latent_w,
         out[ci] = hi
         used_c.add(ci)
         used_h.add(hi)
+    return out
+
+
+def assign_masks_by_points(masks, points_latent):
+    """Безымянные инстанс-маски + якорные точки -> {char_idx: mask_idx}.
+
+    Для каждого персонажа берём маску, ВНУТРИ которой лежит его точка
+    (главный сигнал — переживает окклюзию: точка на видимой части тела), при
+    равенстве — ближайшую по центроиду. Жадно 1-к-1. masks: (n_inst, H, W),
+    points_latent: [(x, y), ...] в координатах маски.
+    """
+    n_inst = int(masks.shape[0])
+    H, W = int(masks.shape[-2]), int(masks.shape[-1])
+    cents = []
+    for mi in range(n_inst):
+        ys, xs = torch.where(masks[mi] > 0.5)
+        if len(xs):
+            cents.append((float(xs.float().mean()), float(ys.float().mean())))
+        else:
+            cents.append((W / 2.0, H / 2.0))
+    scores = []
+    for ci, (px, py) in enumerate(points_latent):
+        ix = min(W - 1, max(0, int(px)))
+        iy = min(H - 1, max(0, int(py)))
+        for mi in range(n_inst):
+            inside = 1 if float(masks[mi][iy, ix]) > 0.5 else 0
+            cx, cy = cents[mi]
+            dist = (cx - px) ** 2 + (cy - py) ** 2
+            scores.append((inside, -dist, ci, mi))
+    scores.sort(reverse=True)              # сначала «точка внутри», потом ближе
+    used_c, used_m, out = set(), set(), {}
+    for _inside, _nd, ci, mi in scores:
+        if ci in used_c or mi in used_m:
+            continue
+        out[ci] = mi
+        used_c.add(ci)
+        used_m.add(mi)
     return out
 
 
@@ -1590,6 +1642,10 @@ class UnblendDynamicSampler:
                 "bound_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "self_attn_jail": ("BOOLEAN", {"default": True}),
                 "jail_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                # ЛОК ЛИЧНОСТИ: доплата своим distinctive-токенам внутри зоны
+                # (волосы/глаза/сигнатура лочатся плотнее -> чище разделение).
+                # 0 = выкл, 1.0 умеренно, выше = жёстче (риск пере-рендера черты).
+                "identity_lock": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.25}),
                 "subject_word": ("STRING", {"default": "girl"}),
                 # watershed: граница зон по краям картинки (одежда/кожа) —
                 # для объятий/поцелуев. nearest_center: чистый Вороной.
@@ -1632,7 +1688,7 @@ class UnblendDynamicSampler:
     def run(self, model, clip, latent_image, prompt, negative_prompt, seed,
             steps, cfg, sampler_name, scheduler, warmup_at, refresh_every,
             mask_source, map_threshold, bound_strength, self_attn_jail,
-            jail_strength, subject_word, divider="watershed",
+            jail_strength, subject_word, identity_lock=1.0, divider="watershed",
             init_ratios="1,1", char_points="", early_jail=False, vae=None):
         import comfy.sample
 
@@ -1664,7 +1720,7 @@ class UnblendDynamicSampler:
         state = _DynamicState(
             spans, refresh_every, warmup_steps, map_threshold,
             bound_strength, jail_strength, jail_max_seq=4096,
-            bias_spans=bias_spans)
+            bias_spans=bias_spans, identity_lock=identity_lock)
         info.append(f"персонажей: {len(present)}, warmup {warmup_steps}/{steps}, "
                     f"refresh каждые {refresh_every}")
 
@@ -2095,12 +2151,211 @@ class UnblendRemaskHires:
         return (m, draw_cond, neg_cond, out_masks, preview, info_str)
 
 
+class UnblendAssignMasks:
+    """Безымянные инстанс-маски (SAM и т.п.) -> char_masks в порядке CHAR1..N.
+
+    Мост: SAM/детектор дают чистую ГЕОМЕТРИЮ (и переживают окклюзию), а
+    «кто есть кто» назначается по якорным ТОЧКАМ — маска, внутри которой
+    лежит точка CHARi, становится её маской. На выходе — упорядоченные маски
+    для Sequential Refine / Remask (строка i = CHARi+1).
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "masks": ("MASK",),
+                # точки по порядку CHAR1; CHAR2; ... (норм. 0..1), как в Dynamic
+                "char_points": ("STRING", {"default": "0.25,0.5; 0.75,0.5"}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK", "IMAGE", "STRING")
+    RETURN_NAMES = ("char_masks", "mask_preview", "info")
+    FUNCTION = "run"
+    CATEGORY = "Unblend"
+
+    def run(self, masks, char_points):
+        m = masks
+        if m.dim() == 2:
+            m = m.unsqueeze(0)
+        m = m.float()
+        n_inst, H, W = m.shape[0], m.shape[-2], m.shape[-1]
+
+        pts = parse_char_points(char_points, n_inst if n_inst >= 2 else 2)
+        if not pts:
+            raise ValueError("[UnblendAssign] нужно минимум 2 точки в char_points")
+        n = len(pts)
+        points_latent = [(x * W, y * H) for (x, y) in pts]
+
+        assign = assign_masks_by_points(m, points_latent)
+        rows, info = [], []
+        for ci in range(n):
+            mi = assign.get(ci)
+            if mi is None:
+                rows.append(torch.zeros(H, W))
+                info.append(f"CHAR{ci+1}: маска не найдена")
+            else:
+                rows.append(m[mi])
+                info.append(f"CHAR{ci+1}<-маска#{mi}")
+        out = torch.stack(rows)
+
+        background = (out.sum(dim=0) < 0.5).float()
+        preview = UnblendBoundedSampler._mask_preview(out, background)
+        info_str = f"инстансов: {n_inst}, персонажей: {n} | " + ", ".join(info)
+        print(f"[UnblendAssign] {info_str}")
+        return (out, preview, info_str)
+
+
+def sequential_char_prompt(sections, char_text, subject_word="girl"):
+    """Промпт одного персонажа для рефайна: общий контекст (стиль/сцена/свет)
+    + ТОЛЬКО его [CHARn]. Без соседки и без [INTERACT] — чтобы в проходе этого
+    персонажа не было ни одного чужого токена (ноль утечки признаков).
+    """
+    head = f"1{subject_word}, " + _clean(char_text)
+    return _join([sections["quality"], sections["style"], head,
+                  sections["body"], sections["scene"], sections["camera"]])
+
+
+class UnblendSequentialRefine:
+    """По-персонажный масочный img2img: каждого добиваем ОТДЕЛЬНО его промптом.
+
+    Ставится ВМЕСТО детейл-KSampler'а (берёт image, отдаёт image; сэмплинг
+    внутри). Композиция/контакт уже сложены прошлым проходом — здесь каждый
+    регион перерисовывается ТОЛЬКО со своим [CHARn] (токенов соседки нет ->
+    ноль утечки признаков), а поза держится низким denoise + noise_mask.
+    Опц. финальный хармонайз убирает швы на стыке.
+
+    Порядок важен: это refine ПОСЛЕ совместного чернового прохода, иначе
+    взаимодействие (объятия/касания) не сложится — оно рождается со-генерацией.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import comfy.samplers
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "image": ("IMAGE",),
+                "char_masks": ("MASK",),
+                "prompt": ("STRING", {"multiline": True, "default":
+                    "[QUALITY] masterpiece, best quality\n"
+                    "[STYLE] anime style\n"
+                    "[SCENE] simple background\n"
+                    "[CHAR1] columbina (genshin impact), black hair, white dress\n"
+                    "[CHAR2] fischl (genshin impact), blonde hair, eyepatch\n"
+                    "[BODY] slim body"}),
+                "negative_prompt": ("STRING", {"multiline": True, "default":
+                    "lowres, worst quality, low quality, bad anatomy, bad hands"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "steps": ("INT", {"default": 24, "min": 4, "max": 200}),
+                "cfg": ("FLOAT", {"default": 5.5, "min": 0.5, "max": 20.0, "step": 0.5}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                # сила перерисовки региона: ниже = вернее держит позу,
+                # выше = сильнее чистит черты/одежду. 0.4-0.55 обычно.
+                "refine_denoise": ("FLOAT", {"default": 0.45, "min": 0.1, "max": 0.95, "step": 0.05}),
+                # финальный проход без маски, чтобы сшить швы и свет. 0 = выкл.
+                "harmonize_denoise": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 0.6, "step": 0.02}),
+                "mask_feather": ("INT", {"default": 4, "min": 0, "max": 32}),
+                "subject_word": ("STRING", {"default": "girl"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "STRING")
+    RETURN_NAMES = ("image", "mask_preview", "info")
+    FUNCTION = "run"
+    CATEGORY = "Unblend"
+
+    def run(self, model, clip, vae, image, char_masks, prompt, negative_prompt,
+            seed, steps, cfg, sampler_name, scheduler, refine_denoise=0.45,
+            harmonize_denoise=0.18, mask_feather=4, subject_word="girl"):
+        import comfy.sample
+        import comfy.utils
+
+        _check_sdxl(model)
+        info = []
+        subj = subject_word.strip() or "girl"
+
+        sections = parse_prompt(prompt)
+        char_texts = [_clean(sections[f"char{i}"]) for i in range(1, 5)]
+        present_idx = [i for i, c in enumerate(char_texts) if c]
+        if not present_idx:
+            raise ValueError("[UnblendSeqRefine] нет ни одного заполненного [CHARn]")
+
+        neg_cond = UnblendBoundedSampler._encode(clip, negative_prompt)
+
+        # ── картинка -> латент, маски -> латентное разрешение + перо ────────
+        latent = vae.encode(image[:, :, :, :3])
+        h_lat, w_lat = latent.shape[-2:]
+        cm = char_masks
+        if cm.dim() == 2:
+            cm = cm.unsqueeze(0)
+        cm = cm.float()
+        cm = F.interpolate(cm.unsqueeze(1), size=(h_lat, w_lat),
+                           mode="bilinear", align_corners=False).squeeze(1)
+        cm = feather_masks(cm, mask_feather)            # (n, h_lat, w_lat)
+
+        # ── по очереди: масочный img2img каждого персонажа ──────────────────
+        cur = latent
+        done = []
+        for k, i in enumerate(present_idx):
+            if i >= cm.shape[0]:
+                info.append(f"CHAR{i+1}: нет маски — пропуск")
+                continue
+            mask = cm[i]
+            if float(mask.max()) < 0.02:
+                info.append(f"CHAR{i+1}: пустая маска — пропуск")
+                continue
+            pos = UnblendBoundedSampler._encode(
+                clip, sequential_char_prompt(sections, char_texts[i], subj))
+            mask_lat = mask.view(1, 1, h_lat, w_lat)
+            noise = comfy.sample.prepare_noise(cur, seed + k, None)
+            cur = comfy.sample.sample(
+                model, noise, steps, cfg, sampler_name, scheduler,
+                pos, neg_cond, cur,
+                denoise=refine_denoise, disable_noise=False,
+                start_step=None, last_step=None, force_full_denoise=False,
+                noise_mask=mask_lat, callback=None,
+                disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed + k)
+            done.append(i + 1)
+
+        info.append(f"рефайн CHAR{done} @ denoise {refine_denoise}")
+
+        # ── финальный хармонайз без маски: сшить швы/свет ───────────────────
+        if harmonize_denoise > 0:
+            draw, _, _ = build_blocks(prompt, subject_word=subj)
+            pos_all = UnblendBoundedSampler._encode(clip, draw)
+            noise = comfy.sample.prepare_noise(cur, seed + 999, None)
+            cur = comfy.sample.sample(
+                model, noise, steps, cfg, sampler_name, scheduler,
+                pos_all, neg_cond, cur,
+                denoise=harmonize_denoise, disable_noise=False,
+                start_step=None, last_step=None, force_full_denoise=True,
+                noise_mask=None, callback=None,
+                disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed + 999)
+            info.append(f"хармонайз @ denoise {harmonize_denoise}")
+
+        out_image = vae.decode(cur)
+
+        background = (cm.sum(dim=0) < 0.5).float()
+        preview = UnblendBoundedSampler._mask_preview(cm, background)
+
+        info_str = " | ".join(info)
+        print(f"[UnblendSeqRefine] {info_str}")
+        return (out_image, preview, info_str)
+
+
 NODE_CLASS_MAPPINGS = {
     "UnblendCoupleApply": UnblendCoupleApply,
     "UnblendZoneMasks": UnblendZoneMasks,
     "UnblendBoundedSampler": UnblendBoundedSampler,
     "UnblendDynamicSampler": UnblendDynamicSampler,
     "UnblendRemaskHires": UnblendRemaskHires,
+    "UnblendSequentialRefine": UnblendSequentialRefine,
+    "UnblendAssignMasks": UnblendAssignMasks,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UnblendCoupleApply": "Unblend Couple Apply (SDXL + jail)",
@@ -2108,4 +2363,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "UnblendBoundedSampler": "Unblend Bounded Sampler (2-phase)",
     "UnblendDynamicSampler": "Unblend Dynamic Sampler (Bounded Attention)",
     "UnblendRemaskHires": "Unblend Remask @ HiRes (detail pass)",
+    "UnblendSequentialRefine": "Unblend Sequential Refine (per-char img2img)",
+    "UnblendAssignMasks": "Unblend Assign Masks (SAM → CHARn by points)",
 }
