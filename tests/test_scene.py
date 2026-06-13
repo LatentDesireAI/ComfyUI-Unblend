@@ -69,6 +69,23 @@ ra = sn.load_scene_book(ALT, 1)
 check("синонимы scenes/body/points",
       ra["prompt"] == "B" and ra["char_points"] == "0,0; 1,1")
 
+# ── ориентация (horizontal) ─────────────────────────────────────────────────
+ORI = json.dumps({"prefix": "P", "prompts": [
+    {"prompt": "a", "horizontal": True},
+    {"prompt": "b", "horizontal": False},
+    {"prompt": "c", "format": "16:9"},
+    {"prompt": "d", "ratio": "9:16"},
+    {"prompt": "e"},
+]})
+check("ориентация: bool true", sn.load_scene_book(ORI, 1)["horizontal"] is True)
+check("ориентация: bool false", sn.load_scene_book(ORI, 2)["horizontal"] is False)
+check("ориентация: 16:9 -> true", sn.load_scene_book(ORI, 3)["horizontal"] is True)
+check("ориентация: 9:16 -> false", sn.load_scene_book(ORI, 4)["horizontal"] is False)
+check("ориентация: не задано -> default True",
+      sn.load_scene_book(ORI, 5, default_horizontal=True)["horizontal"] is True)
+check("ориентация: не задано -> default False",
+      sn.load_scene_book(ORI, 5, default_horizontal=False)["horizontal"] is False)
+
 # нет промптов -> ошибка
 try:
     sn.load_scene_book(json.dumps({"prefix": "x", "prompts": []}), 1)
@@ -84,6 +101,10 @@ if os.path.isfile(ex):
     check("пример-JSON: full содержит префикс и сцену",
           "[QUALITY]" in re["full_prompt"] and "[SCENE]" in re["full_prompt"])
     check("пример-JSON: char_points есть", "," in re["char_points"], re["char_points"])
+    check("пример-JSON: сцена 1 горизонтальная (лежат сверху)",
+          re["horizontal"] is True, str(re["horizontal"]))
+    check("пример-JSON: сцена 2 вертикальная",
+          sn.load_scene_book(ex, 2)["horizontal"] is False)
 else:
     check("пример-JSON присутствует", False, "файл не найден")
 
