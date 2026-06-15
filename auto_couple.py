@@ -1225,11 +1225,13 @@ def head_char_affinity(ema_maps, head_boxes, latent_h, latent_w, img_w, img_h):
     return out
 
 
-def parse_char_points(s, n_chars):
+def parse_char_points(s, n_chars=None, min_points=2):
     """'x,y; x,y' (норм. 0..1, по порядку CHAR1..N) -> [(x,y), ...] или None.
 
     Разделитель пар — ';' или перевод строки; внутри пары — любые два числа.
-    Меньше точек, чем персонажей -> добиваем последней; больше -> отрезаем.
+    min_points: минимум распознанных точек (иначе None). Для соло — 1.
+    n_chars: если задан, добиваем последней / отрезаем до n_chars;
+             None — возвращаем ровно столько точек, сколько распознали.
     """
     if not s or not s.strip():
         return None
@@ -1240,8 +1242,10 @@ def parse_char_points(s, n_chars):
             x = min(1.0, max(0.0, float(nums[0])))
             y = min(1.0, max(0.0, float(nums[1])))
             pts.append((x, y))
-    if len(pts) < 2:
+    if len(pts) < min_points:
         return None
+    if n_chars is None:
+        return pts
     pts = pts[:n_chars]
     while len(pts) < n_chars:
         pts.append(pts[-1])
@@ -2176,6 +2180,9 @@ class UnblendAssignMasks:
     «кто есть кто» назначается по якорным ТОЧКАМ — маска, внутри которой
     лежит точка CHARi, становится её маской. На выходе — упорядоченные маски
     для Sequential Refine / Remask (строка i = CHARi+1).
+
+    Соло: 1 точка -> 1 персонаж; без точек, но с масками -> берётся самая
+    крупная маска как CHAR1. Не падает на одном персонаже.
     """
 
     @classmethod
@@ -2200,27 +2207,34 @@ class UnblendAssignMasks:
         m = m.float()
         n_inst, H, W = m.shape[0], m.shape[-2], m.shape[-1]
 
-        pts = parse_char_points(char_points, n_inst if n_inst >= 2 else 2)
+        pts = parse_char_points(char_points, min_points=1)   # 1+ точек (соло ок)
+        info = []
         if not pts:
-            raise ValueError("[UnblendAssign] нужно минимум 2 точки в char_points")
-        n = len(pts)
-        points_latent = [(x * W, y * H) for (x, y) in pts]
-
-        assign = assign_masks_by_points(m, points_latent)
-        rows, info = [], []
-        for ci in range(n):
-            mi = assign.get(ci)
-            if mi is None:
-                rows.append(torch.zeros(H, W))
-                info.append(f"CHAR{ci+1}: маска не найдена")
-            else:
-                rows.append(m[mi])
-                info.append(f"CHAR{ci+1}<-маска#{mi}")
-        out = torch.stack(rows)
+            # ни одной точки -> соло-фолбэк: самая крупная маска как CHAR1
+            if n_inst == 0:
+                raise ValueError("[UnblendAssign] нет ни масок, ни точек")
+            best = int(max(range(n_inst), key=lambda i: float(m[i].sum())))
+            out = m[best:best + 1].clone()
+            info.append(f"без точек -> соло: маска#{best} (крупнейшая) как CHAR1")
+        else:
+            n = len(pts)
+            points_latent = [(x * W, y * H) for (x, y) in pts]
+            assign = assign_masks_by_points(m, points_latent)
+            rows = []
+            for ci in range(n):
+                mi = assign.get(ci)
+                if mi is None:
+                    rows.append(torch.zeros(H, W))
+                    info.append(f"CHAR{ci+1}: маска не найдена")
+                else:
+                    rows.append(m[mi])
+                    info.append(f"CHAR{ci+1}<-маска#{mi}")
+            out = torch.stack(rows)
 
         background = (out.sum(dim=0) < 0.5).float()
         preview = UnblendBoundedSampler._mask_preview(out, background)
-        info_str = f"инстансов: {n_inst}, персонажей: {n} | " + ", ".join(info)
+        info_str = (f"инстансов: {n_inst}, персонажей: {out.shape[0]} | "
+                    + ", ".join(info))
         print(f"[UnblendAssign] {info_str}")
         return (out, preview, info_str)
 

@@ -423,6 +423,17 @@ inst2 = torch.stack([front, back])
 asg2 = ac.assign_masks_by_points(inst2, [(4.0, 4.0), (11.0, 11.0)])
 check("assign: окклюзия по containment", asg2[0] == 1 and asg2[1] == 0, str(asg2))
 
+# соло: 1 точка -> 1 назначение; parse_char_points с min_points=1 / n_chars=None
+asg_solo = ac.assign_masks_by_points(inst, [(4.0, 8.0)])
+check("assign соло: 1 точка -> левый инстанс", asg_solo == {0: 1}, str(asg_solo))
+check("points: 1 точка при min_points=1",
+      ac.parse_char_points("0.5,0.5", min_points=1) == [(0.5, 0.5)])
+check("points: n_chars=None -> все распознанные",
+      ac.parse_char_points("0.2,0.3; 0.8,0.3; 0.5,0.9", min_points=1)
+      == [(0.2, 0.3), (0.8, 0.3), (0.5, 0.9)])
+check("points: 1 точка при дефолте(2) -> None",
+      ac.parse_char_points("0.5,0.5", 2) is None)
+
 print()
 print("ИТОГ:", "все тесты прошли" if not fails else f"ПРОВАЛЕНО: {fails}")
 sys.exit(1 if fails else 0)
