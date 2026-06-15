@@ -2326,14 +2326,35 @@ class UnblendSequentialRefine:
         sections = parse_prompt(prompt)
         char_texts = [_clean(sections[f"char{i}"]) for i in range(1, 5)]
         present_idx = [i for i, c in enumerate(char_texts) if c]
-        if not present_idx:
-            raise ValueError("[UnblendSeqRefine] нет ни одного заполненного [CHARn]")
 
         neg_cond = UnblendBoundedSampler._encode(clip, negative_prompt)
-
-        # ── картинка -> латент, маски -> латентное разрешение + перо ────────
         latent = vae.encode(image[:, :, :, :3])
         h_lat, w_lat = latent.shape[-2:]
+        cur = latent
+
+        # ── 0 персонажей (сцена без [CHARn]): детейл всего кадра полным
+        #    промптом, без масок — не падаем на пустых персонажах ──────────
+        if not present_idx:
+            draw, _, _ = build_blocks(prompt, subject_word=subj)
+            pos_all = UnblendBoundedSampler._encode(clip, draw)
+            noise = comfy.sample.prepare_noise(cur, seed, None)
+            cur = comfy.sample.sample(
+                model, noise, steps, cfg, sampler_name, scheduler,
+                pos_all, neg_cond, cur,
+                denoise=refine_denoise, disable_noise=False,
+                start_step=None, last_step=None, force_full_denoise=False,
+                noise_mask=None, callback=None,
+                disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed)
+            out_image = vae.decode(cur)
+            full = torch.ones(1, h_lat, w_lat)
+            preview = UnblendBoundedSampler._mask_preview(
+                full, torch.zeros(h_lat, w_lat))
+            info.append("сцена без [CHARn] — детейл всего кадра полным промптом")
+            info_str = " | ".join(info)
+            print(f"[UnblendSeqRefine] {info_str}")
+            return (out_image, preview, info_str)
+
+        # ── маски -> латентное разрешение + перо ────────────────────────────
         cm = char_masks
         if cm.dim() == 2:
             cm = cm.unsqueeze(0)
@@ -2343,7 +2364,6 @@ class UnblendSequentialRefine:
         cm = feather_masks(cm, mask_feather)            # (n, h_lat, w_lat)
 
         # ── по очереди: масочный img2img каждого персонажа ──────────────────
-        cur = latent
         done = []
         for k, i in enumerate(present_idx):
             if i >= cm.shape[0]:
