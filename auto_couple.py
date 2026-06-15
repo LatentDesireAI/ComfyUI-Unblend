@@ -2431,21 +2431,17 @@ class UnblendSequentialRefine:
         return (out_image, preview, info_str)
 
 
+# Only the active pipeline nodes are registered. UnblendBoundedSampler /
+# UnblendCoupleApply / UnblendZoneMasks / UnblendRemaskHires classes stay
+# defined above (BoundedSampler provides shared _encode / _mask_preview helpers
+# used by the others) but are no longer exposed in the node menu.
 NODE_CLASS_MAPPINGS = {
-    "UnblendCoupleApply": UnblendCoupleApply,
-    "UnblendZoneMasks": UnblendZoneMasks,
-    "UnblendBoundedSampler": UnblendBoundedSampler,
     "UnblendDynamicSampler": UnblendDynamicSampler,
-    "UnblendRemaskHires": UnblendRemaskHires,
-    "UnblendSequentialRefine": UnblendSequentialRefine,
     "UnblendAssignMasks": UnblendAssignMasks,
+    "UnblendSequentialRefine": UnblendSequentialRefine,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "UnblendCoupleApply": "Unblend Couple Apply (SDXL + jail)",
-    "UnblendZoneMasks": "Unblend Zone Masks (RP matrix)",
-    "UnblendBoundedSampler": "Unblend Bounded Sampler (2-phase)",
     "UnblendDynamicSampler": "Unblend Dynamic Sampler (Bounded Attention)",
-    "UnblendRemaskHires": "Unblend Remask @ HiRes (detail pass)",
-    "UnblendSequentialRefine": "Unblend Sequential Refine (per-char img2img)",
     "UnblendAssignMasks": "Unblend Assign Masks (SAM → CHARn by points)",
+    "UnblendSequentialRefine": "Unblend Sequential Refine (per-char img2img)",
 }
