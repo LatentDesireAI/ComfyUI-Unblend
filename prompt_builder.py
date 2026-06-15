@@ -35,7 +35,12 @@ _CHAR_SLOTS = ["char1", "char2", "char3", "char4"]
 # Порядок здесь = канонический порядок секций при сборке
 _TAGS = ["QUALITY", "STYLE", "SCENE", "CAMERA",
          "CHAR1", "CHAR2", "CHAR3", "CHAR4", "BODY", "INTERACT"]
-_TAG_RE = re.compile(r"\[\s*(" + "|".join(_TAGS) + r")\s*\]", re.IGNORECASE)
+# Алиасы: для солки рука пишет [CHAR]/[CHARACTER] без цифры -> это CHAR1.
+# В regex идут ПОСЛЕ CHAR1..4 (длинные/точные совпадают первыми).
+_TAG_ALIASES = {"char": "char1", "character": "char1"}
+_TAG_RE = re.compile(
+    r"\[\s*(" + "|".join(_TAGS + ["CHARACTER", "CHAR"]) + r")\s*\]",
+    re.IGNORECASE)
 
 
 def _clean(s):
@@ -72,6 +77,7 @@ def parse_prompt(text):
 
     for i in range(1, len(chunks), 2):
         tag = chunks[i].lower()
+        tag = _TAG_ALIASES.get(tag, tag)        # [CHAR]/[CHARACTER] -> char1
         content = chunks[i + 1] if i + 1 < len(chunks) else ""
         sections[tag] = (sections[tag] + ", " + content) if sections[tag] else content
     return sections

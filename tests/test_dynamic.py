@@ -434,6 +434,16 @@ check("points: n_chars=None -> все распознанные",
 check("points: 1 точка при дефолте(2) -> None",
       ac.parse_char_points("0.5,0.5", 2) is None)
 
+# ── алиас [CHAR]/[CHARACTER] -> char1 (солка пишет без цифры) ───────────────
+pa = ac.parse_prompt("[QUALITY] q\n[CHAR] columbina, white dress")
+check("[CHAR] -> char1", pa["char1"].strip().startswith("columbina"), pa["char1"])
+check("[CHAR] не утёк в quality", "columbina" not in pa["quality"])
+pa2 = ac.parse_prompt("[CHARACTER] fischl")
+check("[CHARACTER] -> char1", pa2["char1"].strip() == "fischl", pa2["char1"])
+pa3 = ac.parse_prompt("[CHAR1] a\n[CHAR2] b")
+check("[CHAR1]/[CHAR2] не сломаны",
+      pa3["char1"].strip() == "a" and pa3["char2"].strip() == "b")
+
 print()
 print("ИТОГ:", "все тесты прошли" if not fails else f"ПРОВАЛЕНО: {fails}")
 sys.exit(1 if fails else 0)
