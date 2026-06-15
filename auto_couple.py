@@ -1611,6 +1611,10 @@ class UnblendDynamicSampler:
     Один проход, один draw-промпт. После warmup токены каждого [CHARn]
     влияют только на пиксели его живой маски; self-attn jail режет
     подглядывание между персонажами. Маски едут вместе с композицией.
+
+    Соло-фолбэк: при 0-1 заполненных [CHARn] bounded attention не нужен
+    (субъект один) -> обычный сэмплинг без couple/jail, выходы совместимы
+    с графом (full-frame маска). Не падает на солке.
     """
 
     @classmethod
@@ -1705,12 +1709,26 @@ class UnblendDynamicSampler:
         sections = parse_prompt(prompt)
         char_texts = [_clean(sections[f"char{i}"]) for i in range(1, 5)]
         present = [c for c in char_texts if c]
-        if len(present) < 2:
-            raise ValueError("[UnblendDynamic] нужно минимум 2 заполненных [CHARn]")
         draw, _, _ = build_blocks(prompt, subject_word=(subject_word.strip() or "girl"))
-
         draw_cond = UnblendBoundedSampler._encode(clip, draw)
         neg_cond = UnblendBoundedSampler._encode(clip, negative_prompt)
+
+        # ── соло / 0 персонажей: bounded attention не нужен (субъект один и
+        #    владеет всем кадром) -> обычный сэмплинг, выходы совместимы с графом
+        if len(present) < 2:
+            m = model.clone()
+            noise = comfy.sample.prepare_noise(latent, seed, None)
+            out = self._run_sample(m, noise, steps, cfg, sampler_name, scheduler,
+                                   draw_cond, neg_cond, latent, seed, None)
+            full = torch.ones(1, H, W)
+            preview = UnblendBoundedSampler._mask_preview(full, torch.zeros(H, W))
+            info.append(f"соло-режим ({len(present)} перс.) — обычный сэмплинг, "
+                        f"без couple/jail")
+            info_str = " | ".join(info)
+            print(f"[UnblendDynamic] {info_str}")
+            return ({"samples": out}, full, preview, info_str,
+                    m, draw_cond, neg_cond)
+
         bias_spans, spans = find_char_spans(clip, draw, present)
         missing = [i + 1 for i, s in bias_spans.items() if not s]
         if missing:
