@@ -4,3 +4,4 @@ numpy
 dghs-realutils
 dghs-imgutils
 rtmlib
+onnxruntime

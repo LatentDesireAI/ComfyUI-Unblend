@@ -3,6 +3,7 @@ name = "comfyui-unblend"
 description = "Character separation for anime art in ComfyUI: detection, instance masks, exclusive regions, prompt routing and pose extraction — fixes character blending on multi-character images."
 version = "0.2.0"
 license = { file = "LICENSE" }
+authors = [{ name = "LatentDesireAI", email = "latentdesire@pm.me" }]
 dependencies = [
     "ultralytics>=8.3.0",
     "opencv-python",
@@ -10,12 +11,13 @@ dependencies = [
     "dghs-realutils",
     "dghs-imgutils",
     "rtmlib",
+    "onnxruntime",
 ]
 
 [project.urls]
-Repository = "https://github.com/TheMrLordicus/ComfyUI-Unblend"
+Repository = "https://github.com/LatentDesireAI/ComfyUI-Unblend"
 
 [tool.comfy]
-PublisherId = "themrlordicus"
+PublisherId = "latentdesireai"
 DisplayName = "ComfyUI-Unblend"
 Icon = ""

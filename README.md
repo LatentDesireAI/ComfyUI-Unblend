@@ -67,3 +67,23 @@ python tests/test_helpers.py
 python tests/test_patches.py
 python tests/test_scene.py
 ```
+
+---
+
+## Support
+
+This node is free and MIT-licensed. If it saved you time, the best way to give
+back is through the art it was built to make:
+
+**🔗 [linktr.ee/latentdesire](https://linktr.ee/latentdesire)** — Patreon, Ko-fi
+and public galleries (Pixiv).
+
+> ⚠️ **18+ / NSFW.** The Patreon and galleries contain adult artwork and the
+> pages are age-gated. Not safe for work — 18+ only.
+
+## Credits
+
+Built by **LatentDesireAI**, in collaboration with **Fable 5** and **Claude
+Opus 4.8** — from the attention-kernel research through to this release.
+
+Found a bug or have an idea? Open an issue or a PR.
