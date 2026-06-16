@@ -11,9 +11,6 @@ grind (prompt books, poses, line counter).
 
 > 📝 How to write tagged prompts (`[CHARn]` etc.), ready examples and
 > troubleshooting — see **[PROMPTING.md](PROMPTING.md)**.
->
-> 📖 "Manga from panels" idea (same characters / scene, different actions) —
-> roadmap in **[MANGA_PLAN.md](MANGA_PLAN.md)**.
 
 ---
 

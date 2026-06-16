@@ -1,71 +1,71 @@
-# Правила и примеры промптов для Unblend
+# Prompt rules and examples for Unblend
 
-Практическая шпаргалка по написанию тегированных промптов
+A practical cheat sheet for writing tagged prompts
 (`[QUALITY] [STYLE] [SCENE] [CAMERA] [CHARn] [INTERACT] [BODY]`)
-для нод **Unblend Dynamic Sampler**, **Bounded Sampler** и **Prompt Builder**.
+for the **Unblend Dynamic Sampler**, **Bounded Sampler** and **Prompt Builder** nodes.
 
-Большинство правил выведены из реальных багов при сборке сцен на 2+ персонажа.
+Most rules were derived from real bugs while building 2+ character scenes.
 
 ---
 
-## 1. Куда что класть (маршрутизация)
+## 1. Where to put what (routing)
 
-| Тег | Назначение | Dynamic Sampler | Bounded / Prompt Builder |
+| Tag | Purpose | Dynamic Sampler | Bounded / Prompt Builder |
 |---|---|---|---|
-| `[QUALITY]` | эмбеддинги, quality-теги, веса качества/анатомии | `draw` (вся картинка) | `draw` + `base` |
-| `[STYLE]` | финиш/подача: skin, detailed, aesthetic, illustration | `draw` | `draw` + `base` |
-| `[SCENE]` | фон, локация, общий жанр (`yuri`) | `draw` | `draw` + `base` |
-| `[CAMERA]` | свет, ракурс, атмосфера (с весами) | `draw` | `draw` + `base` |
-| `[CHARn]` | **личность персонажа**: имя, волосы, глаза, одежда, поза | **запирается на маску персонажа** (через токен-спан в `draw`) | энкодится в `region_n` |
-| `[INTERACT]` | **взаимодействие** (объятия, кто за кем, касания) | `draw`, ни на кого не запирается | `draw` + `base` + все регионы |
-| `[BODY]` | общее тело | **⚠️ ИГНОРИРУЕТСЯ** (регионы выбрасываются) | идёт в каждый `region_n` |
+| `[QUALITY]` | embeddings, quality tags, quality/anatomy weights | `draw` (whole image) | `draw` + `base` |
+| `[STYLE]` | finish/look: skin, detailed, aesthetic, illustration | `draw` | `draw` + `base` |
+| `[SCENE]` | background, location, overall genre (`yuri`) | `draw` | `draw` + `base` |
+| `[CAMERA]` | light, angle, atmosphere (with weights) | `draw` | `draw` + `base` |
+| `[CHARn]` | **character identity**: name, hair, eyes, clothes, pose | **locked to the character's mask** (via a token span in `draw`) | encoded into `region_n` |
+| `[INTERACT]` | **interaction** (hugging, who is behind whom, touches) | `draw`, not locked to anyone | `draw` + `base` + all regions |
+| `[BODY]` | shared body | **⚠️ IGNORED** (regions are discarded) | goes into every `region_n` |
 
-> **Важно про `[BODY]`:** в Dynamic Sampler билдер вызывается как
-> `draw, _, _ = build_blocks(...)` — `base` и регионы отбрасываются, поэтому
-> `[BODY]` в промпт не попадает. В Dynamic телесные слова вписывай **коротко
-> прямо в каждый `[CHARn]`**. В Bounded / Prompt Builder `[BODY]` работает.
-
----
-
-## 2. Жёсткие правила (это и были баги)
-
-1. **Имя другого персонажа — только в `[INTERACT]`, не в `[CHARn]`.**
-   Если написать «behind columbina» внутри `[CHAR2]`, токен «columbina»
-   привяжется к маске fischl → путаница личностей.
-
-2. **Не пиши `1girl` в `[CHARn]`** — нода сама ставит `2girls` (счётчик
-   добавляется автоматически из `subject_word` + кол-ва персонажей).
-
-3. **`[BODY]` не работает в Dynamic** — телесные слова (`petite`,
-   `small breasts`) вписывай коротко прямо в каждый `[CHARn]`.
-
-4. **Держи `[CHARn]` компактным (~35–45 токенов).**
-   Длинный персонаж рвётся через границу 77-токенного чанка CLIP →
-   `info: токены CHARn не найдены` → персонаж без маски → квадраты вместо
-   силуэта. (Корень — `find_subsequence`; см. раздел 6.)
-
-5. **Сначала идентичность, потом состояние.** Внутри `[CHARn]`:
-   `имя → волосы/глаза/сигнатура → одежда → тело → эмоция → поза`.
-
-6. **Всегда читай строку `info` ноды.** Здоровый прогон:
-   `персонажей: N`, режим `heads+attn-id`, маски не `50.0% / 50.0%`,
-   и **без** строки «токены CHARn не найдены».
+> **Important about `[BODY]`:** in the Dynamic Sampler the builder is called as
+> `draw, _, _ = build_blocks(...)` — `base` and the regions are discarded, so
+> `[BODY]` never reaches the prompt. In Dynamic, write body words **briefly,
+> directly into each `[CHARn]`**. In Bounded / Prompt Builder `[BODY]` works.
 
 ---
 
-## 3. Структура `[CHARn]`
+## 2. Hard rules (these were the bugs)
+
+1. **Another character's name goes only in `[INTERACT]`, not in `[CHARn]`.**
+   If you write "behind columbina" inside `[CHAR2]`, the token "columbina"
+   binds to fischl's mask → identity confusion.
+
+2. **Don't write `1girl` in `[CHARn]`** — the node sets `2girls` itself (the
+   counter is added automatically from `subject_word` + the number of characters).
+
+3. **`[BODY]` doesn't work in Dynamic** — write body words (`petite`,
+   `small breasts`) briefly, directly into each `[CHARn]`.
+
+4. **Keep `[CHARn]` compact (~35–45 tokens).**
+   A long character breaks across the 77-token CLIP chunk boundary →
+   `info: CHARn tokens not found` → a character with no mask → squares instead
+   of a silhouette. (Root cause — `find_subsequence`; see section 6.)
+
+5. **Identity first, then state.** Inside `[CHARn]`:
+   `name → hair/eyes/signature → clothes → body → emotion → pose`.
+
+6. **Always read the node's `info` line.** A healthy run:
+   `characters: N`, mode `heads+attn-id`, masks not `50.0% / 50.0%`,
+   and **no** "CHARn tokens not found" line.
+
+---
+
+## 3. `[CHARn]` structure
 
 ```
-[CHARn] <имя \(серия\)>, <сигнатура: маска/крылья/повязка>, <волосы>, <глаза>,
-        <одежда + состояние>, <тело: petite>, <эмоция: blush, sweat, aroused>,
-        <поза этого тела>
+[CHARn] <name \(series\)>, <signature: mask/wings/eyepatch>, <hair>, <eyes>,
+        <clothes + state>, <body: petite>, <emotion: blush, sweat, aroused>,
+        <pose of this body>
 ```
 
-Скобки в названиях экранируй: `columbina \(genshin impact\)`.
+Escape parentheses in names: `columbina \(genshin impact\)`.
 
 ---
 
-## 4. Готовый эталон (columbina × fischl, рабочий)
+## 4. Ready reference (columbina × fischl, working)
 
 ```
 [QUALITY] masterpiece, best quality, <your quality embeddings>, ultra detailed, absurdres, cel shaded, (correct anatomy:1.2)
@@ -77,200 +77,199 @@
 [INTERACT] yuri spooning, fischl lying behind columbina, hand on her breast, intimate
 ```
 
-### Перенос плоского промпта в теги
+### Mapping a flat prompt onto tags
 
-Эталонный «плоский» промпт раскладывается так:
+The reference "flat" prompt decomposes like this:
 
-| Кусок плоского промпта | Тег |
+| Flat prompt piece | Tag |
 |---|---|
 | `masterpiece, embeddings, (correct anatomy:1.2)` | `[QUALITY]` |
 | `glossy skin, very aesthetic, premium anime illustration` | `[STYLE]` |
-| `1girl, <имя>, волосы, глаза, шляпа` | `[CHARn]` (имя + сигнатура) |
-| `mature face, refined features` | `[CHARn]` (лицо) |
-| одежда, `no panties` | `[CHARn]` (одежда) |
-| `petite, small breasts, slender thighs` | `[CHARn]` коротко (Dynamic) / `[BODY]` (Bounded) |
+| `1girl, <name>, hair, eyes, hat` | `[CHARn]` (name + signature) |
+| `mature face, refined features` | `[CHARn]` (face) |
+| clothes, `no panties` | `[CHARn]` (clothes) |
+| `petite, small breasts, slender thighs` | `[CHARn]` briefly (Dynamic) / `[BODY]` (Bounded) |
 | `old library, bookshelves` | `[SCENE]` |
 | `cinematic lighting, chiaroscuro` | `[CAMERA]` |
 
-> Если стиль «уезжает» — почти всегда дело в содержимом `[STYLE]`.
-> Декоративные слова вроде `moe art style, thick outlines, vivid colors`
-> меняют подачу. Для «премиум» Illustrious-лука держи в `[STYLE]`:
+> If the style "drifts" — it's almost always the contents of `[STYLE]`.
+> Decorative words like `moe art style, thick outlines, vivid colors`
+> change the look. For a "premium" Illustrious look keep in `[STYLE]`:
 > `glossy skin, detailed hair, intricate details, very aesthetic,
 > premium anime illustration`.
 
 ---
 
-## 4b. Аннотированный разбор по тегам (наш рабочий промпт)
+## 4b. Annotated tag-by-tag breakdown (our working prompt)
 
-Свод всех правил сессии на одном живом примере — «почему так» у каждого тега.
+All of the session's rules on one live example — the "why" behind each tag.
 
-### `[QUALITY]` — качество и «движок»
+### `[QUALITY]` — quality and the "engine"
 ```
 masterpiece, best quality, <your quality embeddings>, ultra detailed, absurdres, cel shaded, (correct anatomy:1.2)
 ```
-- Эмбеддинги качества + «движковые» теги, идёт в общий draw на всю картинку.
-- Веса — только на то, что усиливаешь глобально (`correct anatomy:1.2`).
-- Это постоянный «префикс качества» — между сценами не трогаешь.
+- Quality embeddings + "engine" tags; goes into the shared draw over the whole image.
+- Weights — only on what you boost globally (`correct anatomy:1.2`).
+- This is a constant "quality prefix" — don't touch it between scenes.
 
-### `[STYLE]` — подача/финиш
+### `[STYLE]` — look/finish
 ```
 glossy skin, detailed hair, intricate details, very aesthetic, premium anime illustration
 ```
-- Это «финишный хвост», а НЕ `anime style, thick outlines, vivid colors`.
-- Если стиль уехал — причина почти всегда здесь.
+- This is a "finishing tail", NOT `anime style, thick outlines, vivid colors`.
+- If the style drifted — the cause is almost always here.
 
-### `[SCENE]` — фон/сеттинг/жанр
+### `[SCENE]` — background/setting/genre
 ```
 old wooden library, tall dark bookshelves, wooden table, yuri
 ```
-- Локация + общий жанр (`yuri`). Для манги фиксируешь, меняя только действие.
+- Location + overall genre (`yuri`). For manga you fix it, changing only the action.
 
-### `[CHAR1]` / `[CHAR2]` — личности (главное)
+### `[CHAR1]` / `[CHAR2]` — identities (the main thing)
 ```
 [CHAR1] columbina \(genshin impact\), (white x-shaped lace mask), closed eyes, black pink two-tone hair, head wings, white dress pulled up, exposed breasts, (white thighhighs:1.15), petite, blush, aroused, sitting, pleasure expression
 [CHAR2] fischl \(genshin impact\), blonde hair, clear purple eyes, black gothic lolita dress pulled up, exposed breasts, black thighhighs, petite, blush, aroused, pleasure expression
 ```
-1. **Канон-тег с экранированием** `\(...\)` — сильнейший сигнал лица. Не разбавлять синонимами.
-2. **Порядок:** имя → сигнатура → волосы/глаза → одежда+состояние → тело → эмоция → поза.
-3. **Максимальный контраст** — это то, по чему чекпоинт их различает:
-   волосы `black pink` vs `blonde`, глаза `closed` vs `clear purple`,
-   одежда `white` vs `black`, ноги `white` vs `black`.
-4. **Вес — на ЯКОРЬ идентичности**, не «против утечки»: `(white thighhighs:1.15)`
-   держит ЕЁ носки (канон + контраст). Убирать вес у сигнатуры **вредно** — она
-   падает ниже порога рендера (так пропала маска у обеих).
-5. **Без родственных конфликтов:** не `eyepatch` у одной + `x-shaped mask` у
-   другой (оба «накладка на глаз» → текут). Конкурент: `clear purple eyes`.
-6. **Имя соседки и реляции — НЕ сюда** (→ `[INTERACT]`), иначе токен соседки
-   привяжется к этой маске.
-7. **Тело коротко прямо здесь** (`petite`) — `[BODY]` в Dynamic игнорируется.
-8. **Компактно (~40 токенов)** — длинный `[CHARn]` рвётся через 77-токенную
-   границу CLIP → `info: токены CHARn не найдены`.
-9. **Называй всё, что хочешь зафиксировать.** Молчание = канон/подтёк. Не
-   прописал носки → получишь дефолт (у Колумбины канон — тёмные). Это же правило
-   у Sequential Refine: он чинит ТОЛЬКО названное.
+1. **Canonical tag with escaping** `\(...\)` — the strongest face signal. Don't dilute it with synonyms.
+2. **Order:** name → signature → hair/eyes → clothes+state → body → emotion → pose.
+3. **Maximum contrast** — this is what the checkpoint tells them apart by:
+   hair `black pink` vs `blonde`, eyes `closed` vs `clear purple`,
+   clothes `white` vs `black`, legs `white` vs `black`.
+4. **Weight on the identity ANCHOR**, not "against leakage": `(white thighhighs:1.15)`
+   holds HER socks (canon + contrast). Removing weight from a signature is **harmful** — it
+   falls below the render threshold (that's how both masks disappeared).
+5. **No kindred conflicts:** not `eyepatch` on one + `x-shaped mask` on the
+   other (both are "eye covers" → they leak). Competitor: `clear purple eyes`.
+6. **The neighbour's name and relations — NOT here** (→ `[INTERACT]`), otherwise the
+   neighbour's token binds to this mask.
+7. **Body briefly right here** (`petite`) — `[BODY]` is ignored in Dynamic.
+8. **Compact (~40 tokens)** — a long `[CHARn]` breaks across the 77-token
+   CLIP boundary → `info: CHARn tokens not found`.
+9. **Name everything you want to lock.** Silence = canon/leak. Don't
+   specify socks → you get the default (Columbina's canon is dark). Same rule
+   for Sequential Refine: it fixes ONLY what is named.
 
-### `[CAMERA]` — ракурс/свет/горизонт
+### `[CAMERA]` — angle/light/horizon
 ```
 eye level, straight-on view, level horizon, soft warm lighting, (cinematic lighting:1.25), (volumetric lighting:1.3), (chiaroscuro:1.2)
 ```
-- Стабилизаторы горизонта `level horizon, straight-on` — против Dutch-наклона.
-- Убрать `dynamic`, `dramatic angle` — они провоцируют кривой пол.
-- Свет — кластером с весами.
+- Horizon stabilizers `level horizon, straight-on` — against Dutch tilt.
+- Remove `dynamic`, `dramatic angle` — they provoke a crooked floor.
+- Light — as a cluster with weights.
 
-### `[INTERACT]` — взаимодействие и относительные вещи
+### `[INTERACT]` — interaction and relative things
 ```
 fischl pulls columbina closer, surprised, arms around each other, same height, intimate
 ```
-- Сюда: кто что делает с кем, реляции, имена **в контексте действия**.
-- `same height` лечит асимметрию роста (**размер решается композицией, не рефайном**).
-- Поза/действие тут, но **СМЕНА действия требует ControlNet**, не только текста
-  (см. [MANGA_PLAN.md](MANGA_PLAN.md)).
+- Here: who does what to whom, relations, names **in the context of the action**.
+- `same height` fixes height asymmetry (**size is solved by composition, not by refine**).
+- Pose/action goes here, but **changing the action requires ControlNet**, not text alone.
 
-### Чек-лист перед генерацией
-- [ ] канон-теги обоих, экранированы `\(...\)`
-- [ ] контраст по волосам/глазам/одежде максимальный
-- [ ] нет родственных конфликтов (eyewear и т.п.)
-- [ ] всё нужное НАЗВАНО (носки, цвета)
-- [ ] веса на якорях, не «против утечки»
-- [ ] `[CHARn]` компактны (~40 токенов)
-- [ ] имена/реляции в `[INTERACT]`, не в `[CHARn]`
-- [ ] `[CAMERA]` со стабилизаторами горизонта
-- [ ] в `info`: `персонажей: N`, без «не найдены»
+### Pre-generation checklist
+- [ ] canon tags for both, escaped `\(...\)`
+- [ ] max contrast in hair/eyes/clothes
+- [ ] no kindred conflicts (eyewear, etc.)
+- [ ] everything needed is NAMED (socks, colors)
+- [ ] weights on anchors, not "against leakage"
+- [ ] `[CHARn]` are compact (~40 tokens)
+- [ ] names/relations in `[INTERACT]`, not in `[CHARn]`
+- [ ] `[CAMERA]` with horizon stabilizers
+- [ ] in `info`: `characters: N`, no "not found"
 
 ---
 
-## 5. Параметры ноды под нахлёст (spooning / объятия)
+## 5. Node parameters for overlap (spooning / hugging)
 
-- `init_ratios = "1,1"` — стартовые колонки слева/справа. Для «бок о бок» — ок;
-  для сильного нахлёста (spooning) попробуй `""` (выкл) — зоны возьмутся из
-  attn-карт.
-- `divider = watershed` (для объятий/нахлёста, **не** `nearest_center`).
+- `init_ratios = "1,1"` — starting left/right columns. For "side by side" — ok;
+  for heavy overlap (spooning) try `""` (off) — the zones are taken from the
+  attn maps.
+- `divider = watershed` (for hugging/overlap, **not** `nearest_center`).
 - `warmup_at ≈ 0.15–0.25`.
-- `mask_source = attn_maps+silhouette` **+ обязательно подключи VAE**
-  (без VAE силуэт не строится → откат к квадратным зонам).
+- `mask_source = attn_maps+silhouette` **+ be sure to connect a VAE**
+  (without a VAE the silhouette isn't built → fallback to square zones).
 
-### Якорные точки (`char_points`) — ставим персонажей вручную
+### Anchor points (`char_points`) — placing characters manually
 
-Поле `char_points` задаёт, **где** окажется каждый персонаж, нормированными
-координатами `0..1` по порядку `CHAR1; CHAR2; ...` (формат `x,y; x,y`):
+The `char_points` field sets **where** each character lands, in normalized
+coordinates `0..1` in order `CHAR1; CHAR2; ...` (format `x,y; x,y`):
 
 ```
-char_points = 0.25,0.5; 0.75,0.5     # CHAR1 слева-центр, CHAR2 справа-центр
-char_points = 0.5,0.3; 0.5,0.7       # CHAR1 сверху, CHAR2 снизу
+char_points = 0.25,0.5; 0.75,0.5     # CHAR1 left-center, CHAR2 right-center
+char_points = 0.5,0.3; 0.5,0.7       # CHAR1 top, CHAR2 bottom
 ```
 
-Что делает (гибрид):
-- **стартовые зоны с шага 0** строятся вокруг точек (перебивает `init_ratios`);
-- **личность головы** на refresh берётся по **ближайшей точке**, а не по
-  attn-картам — это детерминированно убирает свап и «близнецов»;
-- точные **границы тел** всё равно от силуэта/watershed (точки = позиция и
-  личность, не грубые прямоугольники).
+What it does (hybrid):
+- **starting zones from step 0** are built around the points (overrides `init_ratios`);
+- **head identity** on refresh is taken from the **nearest point**, not from the
+  attn maps — this deterministically removes swaps and "twins";
+- precise **body boundaries** still come from the silhouette/watershed (points = position and
+  identity, not coarse rectangles).
 
-`(0,0)` — левый верх, `(1,1)` — правый низ. Пусто → старая логика
-`init_ratios`. Порядок точек = порядок `[CHARn]`: первая точка → `[CHAR1]`.
+`(0,0)` — top-left, `(1,1)` — bottom-right. Empty → the old `init_ratios`
+logic. Point order = `[CHARn]` order: first point → `[CHAR1]`.
 
-### Генерация `char_points` под промпт (рецепт для LLM)
+### Generating `char_points` for a prompt (recipe for an LLM)
 
-Когда пишешь тегированный промпт по запросу — **сразу выдавай и `char_points`**,
-согласованные с тем, как ты сам описал сцену. Точки и текст не должны
-противоречить (если в `[INTERACT]` «fischl справа» — её точка справа).
+When you write a tagged prompt on request — **output `char_points` too, right away**,
+consistent with how you described the scene. Points and text must not
+contradict (if `[INTERACT]` says "fischl on the right" — her point is on the right).
 
-**Система координат:** нормированные `0..1`. `x`: 0 = лево, 1 = право.
-`y`: 0 = верх, 1 = низ. Точку ставь на **голову/верх тела** персонажа (там
-читается личность и туда смотрит детект). Порядок = порядок `[CHARn]`.
+**Coordinate system:** normalized `0..1`. `x`: 0 = left, 1 = right.
+`y`: 0 = top, 1 = bottom. Put the point on the character's **head / upper body** (that's
+where identity reads and where detection looks). Order = `[CHARn]` order.
 
-**Шаг 1 — раскладка из текста.** Прочитай `[INTERACT]` / `[CAMERA]` / `[SCENE]`:
-«side by side / рядом» → горизонталь; «X слева, Y справа» / «X behind Y» →
-явные стороны; «лежат / один над другим» → вертикаль.
+**Step 1 — layout from the text.** Read `[INTERACT]` / `[CAMERA]` / `[SCENE]`:
+"side by side" → horizontal; "X on the left, Y on the right" / "X behind Y" →
+explicit sides; "lying / one above the other" → vertical.
 
-**Шаг 2 — расставь точки:**
+**Step 2 — place the points:**
 
-| Композиция | `char_points` (CHAR1; CHAR2) | Почему |
+| Composition | `char_points` (CHAR1; CHAR2) | Why |
 |---|---|---|
-| бок-о-бок | `0.3,0.45; 0.7,0.45` | одинаковый y, разный x → раздел вертикальный |
-| широкий разнос | `0.22,0.45; 0.78,0.45` | чище разделение |
-| один над другим / лежат | `0.5,0.35; 0.5,0.65` | одинаковый x, разный y → раздел горизонтальный |
-| X спереди, Y сзади (окклюзия) | точка каждого на ЕГО видимой голове | переживает перекрытие |
-| 3+ персонажа | равномерно по оси: `0.2,0.45; 0.5,0.45; 0.8,0.45` | колонны между соседями |
+| side by side | `0.3,0.45; 0.7,0.45` | same y, different x → vertical divider |
+| wide spread | `0.22,0.45; 0.78,0.45` | cleaner separation |
+| one above the other / lying | `0.5,0.35; 0.5,0.65` | same x, different y → horizontal divider |
+| X in front, Y behind (occlusion) | each one's point on HIS visible head | survives the overlap |
+| 3+ characters | evenly along the axis: `0.2,0.45; 0.5,0.45; 0.8,0.45` | columns between neighbours |
 
-**Шаг 3 — высота `y` под кадр:** по пояс / eye level → `y ≈ 0.35–0.45`;
-полный рост → `y ≈ 0.25–0.35`; крупный план лиц → `y ≈ 0.4–0.5`.
+**Step 3 — `y` height for the frame:** waist-up / eye level → `y ≈ 0.35–0.45`;
+full height → `y ≈ 0.25–0.35`; face close-up → `y ≈ 0.4–0.5`.
 
-**Шаг 4 — согласуй имена.** Сопоставь, кто в `[INTERACT]` слева/справа, и поставь
-точку нужного `[CHARn]` на ту же сторону. Имя соседки в реляции (`[INTERACT]`)
-указывает направление — точки должны ему соответствовать.
+**Step 4 — reconcile names.** Match who is left/right in `[INTERACT]`, and put
+the right `[CHARn]`'s point on the same side. The neighbour's name in the relation (`[INTERACT]`)
+indicates direction — the points must match it.
 
-**Относительный размер (опц.):** раздел зон идёт по **середине между точками**.
-Хочешь одному больше места — сдвинь так, чтобы середина уехала к другому
-(`0.32,0.45; 0.9,0.45` → CHAR1 шире). Эффект слабый (только ранний нудж), размер
-в основном решает композиция/прайор.
+**Relative size (optional):** the zone divider runs through the **midpoint between the points**.
+Want more room for one — shift it so the midpoint moves toward the other
+(`0.32,0.45; 0.9,0.45` → CHAR1 wider). The effect is weak (only an early nudge); size
+is mostly decided by composition/prior.
 
-**Вывод:** к промпту добавляй строку (в порядке CHAR1; CHAR2):
+**Output:** add a line to the prompt (in order CHAR1; CHAR2):
 ```
 char_points = 0.3,0.45; 0.7,0.45
 ```
 
-**Пример (наш промпт — сидят рядом, eye level, columbina слева / fischl справа):**
+**Example (our prompt — sitting together, eye level, columbina left / fischl right):**
 ```
 [INTERACT] fischl pulls columbina closer, side by side, same height, intimate
 char_points = 0.32,0.42; 0.68,0.42
 ```
-CHAR1 = columbina слева (`x=0.32`), CHAR2 = fischl справа (`x=0.68`); одинаковый
-`y` → раздел вертикальный; чуть выше центра (`y=0.42`), т.к. eye level и кадр по
-пояс. `same height` в тексте + симметрия точек = ровные по росту и месту.
+CHAR1 = columbina on the left (`x=0.32`), CHAR2 = fischl on the right (`x=0.68`); same
+`y` → vertical divider; slightly above center (`y=0.42`), since eye level and a waist-up
+frame. `same height` in the text + symmetric points = even in height and place.
 
-### JSON-план сцен для ноды Scene Book (для LLM)
+### JSON scene plan for the Scene Book node (for an LLM)
 
-Когда тебя просят **несколько сцен** — выдавай их одним JSON под ноду
-**Unblend Scene Book**: общий `prefix` ([QUALITY]/[STYLE]) + список сцен, у
-каждой свой `prompt` (тело: [SCENE]/[CHARn]/[CAMERA]/[INTERACT]) и `char_points`.
+When you're asked for **several scenes** — output them as one JSON for the
+**Unblend Scene Book** node: a shared `prefix` ([QUALITY]/[STYLE]) + a list of scenes, each
+with its own `prompt` (body: [SCENE]/[CHARn]/[CAMERA]/[INTERACT]) and `char_points`.
 
 ```json
 {
   "prefix": "[QUALITY] ...\n[STYLE] ...",
   "prompts": [
     {
-      "name": "короткое имя сцены",
+      "name": "short scene name",
       "prompt": "[SCENE] ...\n[CHAR1] ...\n[CHAR2] ...\n[CAMERA] ...\n[INTERACT] ...",
       "char_points": "0.32,0.42; 0.68,0.42",
       "horizontal": false
@@ -279,73 +278,73 @@ CHAR1 = columbina слева (`x=0.32`), CHAR2 = fischl справа (`x=0.68`);
 }
 ```
 
-Правила вывода:
-- **Экранируй** скобки имён в JSON двойным слэшем: `columbina \\(genshin impact\\)`.
-- `prefix` — постоянные [QUALITY]/[STYLE], **один на всю книгу**.
-- `char_points` каждой сцены — по рецепту выше (под её композицию).
-- `horizontal` — рекомендуемый формат: `true` = горизонтальный (landscape),
-  `false` = вертикальный (portrait). Правило: лежат / широкая пара / вид сверху
-  → `true`; стоят / сидят близко / интимный крупный план → `false`.
-- `name` — человекочитаемая метка (локация/действие).
-- Готовый шаблон: `example_workflows/scenes_columbina_fischl.json`.
+Output rules:
+- **Escape** name parentheses in JSON with a double backslash: `columbina \\(genshin impact\\)`.
+- `prefix` — the constant [QUALITY]/[STYLE], **one for the whole book**.
+- each scene's `char_points` — by the recipe above (for its composition).
+- `horizontal` — recommended format: `true` = horizontal (landscape),
+  `false` = vertical (portrait). Rule: lying / wide pair / top view
+  → `true`; standing / sitting close / intimate close-up → `false`.
+- `name` — a human-readable label (location/action).
+- Ready template: `example_workflows/scenes_columbina_fischl.json`.
 
-Юзер кладёт JSON в ноду (путь или inline), гоняет по `index` (или со счётчиком +
-`wrap`), получает `full_prompt` + `char_points` для пайплайна.
+The user puts the JSON into the node (path or inline), runs it by `index` (or with a counter +
+`wrap`), and gets `full_prompt` + `char_points` for the pipeline.
 
 ---
 
-## 6. Траблшутинг
+## 6. Troubleshooting
 
-### Квадраты вместо силуэта (`маски: 50.0% / 50.0%`)
-Это «мягкие зоны» = стартовые `init_ratios`, которые не заменились.
-Причины:
-- **`токены CHARn не найдены`** в `info` — персонаж не запёрся, у него нет
-  чистой attn-карты → детект не может сопоставить голову → откат к колоннам.
-  Лечение: укоротить этот `[CHARn]` (правило 4) либо код-фикс `find_subsequence`.
-- **VAE не подключён** — `info: vae не подключён — силуэт выключен`.
-- ранние шаги `силуэт пустой` — это норма (силуэт появляется к ~50% шагов).
+### Squares instead of a silhouette (`masks: 50.0% / 50.0%`)
+These are "soft zones" = the starting `init_ratios` that weren't replaced.
+Causes:
+- **`CHARn tokens not found`** in `info` — the character isn't locked, it has no
+  clean attn map → detection can't match the head → fallback to columns.
+  Fix: shorten this `[CHARn]` (rule 4) or apply the `find_subsequence` code fix.
+- **VAE not connected** — `info: vae not connected — silhouette off`.
+- early steps `silhouette empty` — this is normal (the silhouette appears by ~50% of steps).
 
-### «Близнецы» / клоны (оба персонажа на одно лицо)
-Известная болячка bounded attention: при сильном нахлёсте и большом
-пересечении токенов личности «протекают» друг в друга.
-Чем лечить:
-- **Усилить различия** в `[CHARn]`: разные волосы/глаза/одежда должны стоять
-  рано и чётко (у нас: `black pink two-tone hair, closed eyes` vs
+### "Twins" / clones (both characters with the same face)
+A known ailment of bounded attention: under heavy overlap and a large
+identity-token intersection, identities "leak" into each other.
+How to fix:
+- **Strengthen the differences** in `[CHARn]`: different hair/eyes/clothes must come
+  early and clearly (ours: `black pink two-tone hair, closed eyes` vs
   `blonde hair, purple eyes, eyepatch`).
-- **Убрать общие токены** там, где можно: одинаковый хвост
-  `blush, sweat, aroused, pleasure expression` в обоих усиливает «клонирование».
-  Оставь общее минимальным, реляцию увели в `[INTERACT]`.
-- **`self_attn_jail = True`, `jail_strength = 1.0`** — режет «подглядывание»
-  self-attn между персонажами.
-- **Поднять `warmup_at`** (0.15 → 0.25): модель успеет развести фигуры до
-  включения bias.
-- Сменить **seed** — на части сидов близнецы вылезают даже при правильном
-  промпте; это вероятностно, а не детерминированно.
+- **Remove shared tokens** where you can: the same tail
+  `blush, sweat, aroused, pleasure expression` in both reinforces "cloning".
+  Keep the shared part minimal, move the relation into `[INTERACT]`.
+- **`self_attn_jail = True`, `jail_strength = 1.0`** — cuts self-attn
+  "peeking" between characters.
+- **Raise `warmup_at`** (0.15 → 0.25): the model gets time to separate the figures before
+  the bias kicks in.
+- Change the **seed** — on some seeds twins show up even with a correct
+  prompt; it's probabilistic, not deterministic.
 
-### Стиль отличается от ожидаемого
-См. раздел 4: причина почти всегда в `[STYLE]`. Перенеси туда «финишный хвост»
-эталона, убери декоративные стиль-слова.
+### Style differs from what's expected
+See section 4: the cause is almost always `[STYLE]`. Move the reference's "finishing tail"
+there, remove decorative style words.
 
-### Признак одной лезет на другую (напр. X-mask Колумбины на Фишл)
-Три канала, по убыванию вклада (проверено на columbina × fischl):
-1. **self-attention копирование** — пиксели B «срисовывают» признак с A. Режется
-   `self_attn_jail` (вкл по умолчанию), но он активен только на **поздней**
-   жёсткой фазе. Опция **`early_jail`** включает его и на ранней мягкой фазе
-   (только для точек бок-о-бок). ⚠️ **`early_jail` ослабляет взаимодействие**
-   (объятия/касания = тот же cross-body self-attn) — для INTERACT-сцен держи
-   ВЫКЛ, для раздельных портретов можно ВКЛ.
-2. **семантика промпта** — родственные концепты текут друг в друга
-   (`eyepatch` ↔ `x-shaped mask` = «накладки на глаз»). Лечится только текстом:
-   держи сигнатуру строго у одного персонажа, второму дай сильный конкурент
+### One character's trait creeps onto the other (e.g. Columbina's X-mask on Fischl)
+Three channels, in decreasing contribution (verified on columbina × fischl):
+1. **self-attention copying** — B's pixels "trace" the trait from A. Cut by
+   `self_attn_jail` (on by default), but it's active only in the **late**
+   hard phase. The **`early_jail`** option turns it on in the early soft phase too
+   (only for side-by-side points). ⚠️ **`early_jail` weakens interaction**
+   (hugging/touching = the same cross-body self-attn) — for INTERACT scenes keep it
+   OFF; for separate portraits you can turn it ON.
+2. **prompt semantics** — kindred concepts leak into each other
+   (`eyepatch` ↔ `x-shaped mask` = "eye covers"). Fixed only by text:
+   keep a signature strictly on one character, give the other a strong competitor
    (`clear purple eyes, no eyewear`).
-3. **cross-attention зоны** — на жёсткой фазе −10000 (стена), на мягкой −4;
-   при этом свои токены персонажа получают boost +2, так что соотношение ~400:1
-   в его пользу. Практически **не вносит** утечки — поэтому **убирать вес у
-   сигнатуры бесполезно для разделения, но вредно для самого персонажа**
-   (его признак падает ниже порога рендера). Вес держи: `(... mask:1.3)`.
+3. **cross-attention zones** — −10000 on the hard phase (a wall), −4 on the soft;
+   meanwhile the character's own tokens get a +2 boost, so the ratio is ~400:1
+   in his favor. In practice it adds **almost no** leakage — so **removing weight from a
+   signature is useless for separation but harmful for the character himself**
+   (his trait falls below the render threshold). Keep the weight: `(... mask:1.3)`.
 
-### Сигнатура пропала после правок промпта
-Если убрал вес у токена И убрал родственный токен у соседа — концепт мог
-держаться на их взаимном подкреплении и упасть ниже порога. Верни вес самому
-персонажу (`(white x-shaped lace mask:1.3)`) — он должен рендериться на
-собственной силе, а не за счёт соседа.
+### A signature disappeared after prompt edits
+If you removed a token's weight AND removed a kindred token from the neighbour, the concept may
+have held on their mutual reinforcement and fallen below the threshold. Restore the weight on the
+character himself (`(white x-shaped lace mask:1.3)`) — it should render on its
+own strength, not thanks to the neighbour.
