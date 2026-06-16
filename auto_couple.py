@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .prompt_builder import build_blocks, parse_prompt, _clean, _join
+from .prompt_builder import build_blocks, parse_prompt, _clean, _join, _subject_list
 
 _CLIP_START = 49406
 _CLIP_END = 49407
@@ -694,7 +694,7 @@ class UnblendBoundedSampler:
                 "base_bleed": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "self_attn_jail": ("BOOLEAN", {"default": True}),
                 "jail_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "subject_word": ("STRING", {"default": "girl"}),
+                "subject_word": ("STRING", {"default": "girl", "tooltip": "Booru count word. One word = all characters (e.g. 'girl'). Comma list for a mixed cast: 'girl, boy' -> CHAR1 girl, CHAR2 boy (padded with the last)."}),
                 # 0 = continue the phase-1 trajectory (gentle, but what already
                 # mixed in phase 1 can't be repainted). >0 = restart from x0 +
                 # fresh noise: like img2img denoise — more power to fix clothes/
@@ -1657,7 +1657,7 @@ class UnblendDynamicSampler:
                 # (hair/eyes/signature lock in tighter -> cleaner separation).
                 # 0 = off, 1.0 moderate, higher = stricter (risk of re-rendering a feature).
                 "identity_lock": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.25}),
-                "subject_word": ("STRING", {"default": "girl"}),
+                "subject_word": ("STRING", {"default": "girl", "tooltip": "Booru count word. One word = all characters (e.g. 'girl'). Comma list for a mixed cast: 'girl, boy' -> CHAR1 girl, CHAR2 boy (padded with the last)."}),
                 # watershed: zone border along image edges (clothing/skin) —
                 # for hugs/kisses. nearest_center: pure Voronoi.
                 "divider": (["watershed", "nearest_center"],),
@@ -2040,7 +2040,7 @@ class UnblendRemaskHires:
                     "[INTERACT] embracing, face to face"}),
                 "negative_prompt": ("STRING", {"multiline": True, "default":
                     "lowres, worst quality, low quality, bad anatomy, bad hands"}),
-                "subject_word": ("STRING", {"default": "girl"}),
+                "subject_word": ("STRING", {"default": "girl", "tooltip": "Booru count word. One word = all characters (e.g. 'girl'). Comma list for a mixed cast: 'girl, boy' -> CHAR1 girl, CHAR2 boy (padded with the last)."}),
                 "divider": (["watershed", "nearest_center"],),
                 "bound_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "self_attn_jail": ("BOOLEAN", {"default": True}),
@@ -2306,7 +2306,7 @@ class UnblendSequentialRefine:
                 # final unmasked pass to blend seams and lighting. 0 = off.
                 "harmonize_denoise": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 0.6, "step": 0.02}),
                 "mask_feather": ("INT", {"default": 4, "min": 0, "max": 32}),
-                "subject_word": ("STRING", {"default": "girl"}),
+                "subject_word": ("STRING", {"default": "girl", "tooltip": "Booru count word. One word = all characters (e.g. 'girl'). Comma list for a mixed cast: 'girl, boy' -> CHAR1 girl, CHAR2 boy (padded with the last)."}),
                 # crop-upscale detail: crop each character by its mask,
                 # upscale the crop to detail_size and repaint THERE — the face
                 # occupies a larger share of the frame => sharp features even for a
@@ -2480,6 +2480,7 @@ class UnblendSequentialRefine:
         sections = parse_prompt(prompt)
         char_texts = [_clean(sections[f"char{i}"]) for i in range(1, 5)]
         present_idx = [i for i, c in enumerate(char_texts) if c]
+        subjects = _subject_list(subj, len(char_texts))   # per-CHARn subject word
 
         neg_cond = UnblendBoundedSampler._encode(clip, negative_prompt)
         latent = vae.encode(image[:, :, :, :3])
@@ -2536,7 +2537,7 @@ class UnblendSequentialRefine:
                     info.append(f"CHAR{i+1}: empty mask — skip")
                     continue
                 pos = UnblendBoundedSampler._encode(
-                    clip, sequential_char_prompt(sections, char_texts[i], subj))
+                    clip, sequential_char_prompt(sections, char_texts[i], subjects[i]))
                 work, msg = self._crop_detail_one(
                     model, vae, work, cm_img[i], pos, neg_cond,
                     seed + k, steps, cfg, sampler_name, scheduler,
@@ -2555,7 +2556,7 @@ class UnblendSequentialRefine:
                     info.append(f"CHAR{i+1}: empty mask — skip")
                     continue
                 pos = UnblendBoundedSampler._encode(
-                    clip, sequential_char_prompt(sections, char_texts[i], subj))
+                    clip, sequential_char_prompt(sections, char_texts[i], subjects[i]))
                 mask_lat = mask.view(1, 1, h_lat, w_lat)
                 noise = comfy.sample.prepare_noise(cur, seed + k, None)
                 cur = comfy.sample.sample(

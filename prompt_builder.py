@@ -83,6 +83,28 @@ def parse_prompt(text):
     return sections
 
 
+def _subject_list(subject_word, n_slots):
+    """Per-character subject words. A single word -> the same for everyone
+    (back-compat); a comma/semicolon list like 'girl, boy' -> CHAR1=girl,
+    CHAR2=boy (padded with the last word for any extra characters)."""
+    words = [w.strip() for w in re.split(r"[;,/]", subject_word or "") if w.strip()]
+    if not words:
+        words = ["girl"]
+    return [words[min(i, len(words) - 1)] for i in range(n_slots)]
+
+
+def _count_phrase(subjects):
+    """Per-character words -> a booru count: ['girl','boy'] -> '1girl, 1boy';
+    ['girl','girl'] -> '2girls'. Grouped by word in first-appearance order."""
+    order, counts = [], {}
+    for w in subjects:
+        if w not in counts:
+            order.append(w)
+            counts[w] = 0
+        counts[w] += 1
+    return ", ".join(f"{counts[w]}{w}" + ("s" if counts[w] > 1 else "") for w in order)
+
+
 def build_blocks(text, subject_word="girl", add_count=True,
                  interact_in_base=True, char_connector="and"):
     """Assemble draw, base, [region_1..region_4] from the tagged string.
@@ -93,15 +115,10 @@ def build_blocks(text, subject_word="girl", add_count=True,
 
     chars = [_clean(s[slot]) for slot in _CHAR_SLOTS]   # positional, keep empties
     present = [c for c in chars if c]
-    n = len(present)
 
-    if n == 0:
-        count_multi = ""
-    elif n == 1:
-        count_multi = f"1{subject_word}"
-    else:
-        count_multi = f"{n}{subject_word}s"
-    count_single = f"1{subject_word}"
+    subjects = _subject_list(subject_word, len(_CHAR_SLOTS))   # per-slot word
+    present_subj = [subjects[i] for i, c in enumerate(chars) if c]
+    count_multi = _count_phrase(present_subj)   # '' / '1girl' / '2girls' / '1girl, 1boy'
 
     # --- DRAW: everything together, the coarse pass ---
     if present:
@@ -133,13 +150,13 @@ def build_blocks(text, subject_word="girl", add_count=True,
     ])
 
     # --- REGION 1..4: one character + shared body + interaction ---
-    def region(char):
+    def region(char, subj):
         if not char:
             return ""               # empty slot -> empty region
-        head = (count_single + ", " + char) if add_count else char
+        head = (f"1{subj}, " + char) if add_count else char
         return _join([head, s["body"], s["interact"]])
 
-    regions = [region(c) for c in chars]
+    regions = [region(c, subjects[i]) for i, c in enumerate(chars)]
     return draw, base, regions
 
 
