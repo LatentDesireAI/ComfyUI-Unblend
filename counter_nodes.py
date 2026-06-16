@@ -1,26 +1,26 @@
 """
 ComfyUI-Unblend :: counter_nodes.py
 ===================================
-UnblendLineCounter — номер строки промпта с авто-продвижением.
+UnblendLineCounter — prompt line number with auto-advance.
 
-Режимы (mode):
-  repeat    — +1 каждые `repeats` прогонов (N вариаций одной строки, потом дальше).
-  increment — +1 КАЖДЫЙ прогон (как Seed Generator на increment).
-  random    — случайная строка в [start_line .. max_line] каждый прогон (как randomize).
-  fixed     — всегда start_line.
+Modes (mode):
+  repeat    — +1 every `repeats` runs (N variations of one line, then move on).
+  increment — +1 on EVERY run (like a Seed Generator on increment).
+  random    — random line in [start_line .. max_line] each run (like randomize).
+  fixed     — always start_line.
 
-`start_line` — точка старта/якорь (его не надо вешать на control_after_generate,
-продвижением управляет сама нода). Смена start_line / repeats / mode сбрасывает
-счёт. Выход line_number (INT) -> в индекс «Text Load Line From File».
+`start_line` — start point / anchor (no need to wire it to control_after_generate,
+the node manages advancing itself). Changing start_line / repeats / mode resets
+the count. Output line_number (INT) -> into the "Text Load Line From File" index.
 
-Счётчик живёт в памяти процесса ComfyUI (после рестарта — со start_line).
+The counter lives in the ComfyUI process memory (after a restart — from start_line).
 """
 
 import random as _random
 
 
 class UnblendLineCounter:
-    """Номер строки с режимами repeat / increment / random / fixed."""
+    """Line number with repeat / increment / random / fixed modes."""
 
     _state = {"count": 0, "anchor": None}
 
@@ -43,7 +43,7 @@ class UnblendLineCounter:
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
-        return float("nan")  # всегда переисполнять, чтобы счётчик тикал
+        return float("nan")  # always re-execute so the counter ticks
 
     def _wrap(self, line, start_line, max_line):
         if max_line and max_line > start_line:
@@ -75,8 +75,8 @@ class UnblendLineCounter:
         rep_pos = (cnt % repeats) + 1
         st["count"] = cnt + 1
 
-        extra = f" | повтор {rep_pos}/{repeats}" if mode == "repeat" else ""
-        info = f"line {line} | mode {mode}{extra} | прогон {cnt + 1}"
+        extra = f" | repeat {rep_pos}/{repeats}" if mode == "repeat" else ""
+        info = f"line {line} | mode {mode}{extra} | run {cnt + 1}"
         return (line, info)
 
 

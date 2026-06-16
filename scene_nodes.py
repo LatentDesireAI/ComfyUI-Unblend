@@ -1,14 +1,14 @@
 """
 Unblend Scene Book
 ==================
-JSON-«книга сцен»: общий префикс ([QUALITY]/[STYLE]) + список промптов, у
-каждого свой текст и char_points. Нода берёт индекс (какая сцена по счёту) и
-отдаёт по отдельности: prefix / prompt / full_prompt / char_points / name.
+A JSON "scene book": a shared prefix ([QUALITY]/[STYLE]) + a list of prompts,
+each with its own text and char_points. The node takes an index (which scene by
+count) and returns separately: prefix / prompt / full_prompt / char_points / name.
 
-Удобно для конвейера «ИИ пишет план-сцены в JSON → ты генеришь по номеру».
-В паре с Unblend Line Counter (increment) → автопроход по всем сценам.
+Handy for a pipeline "an AI writes a scene plan as JSON -> you generate by number".
+Paired with Unblend Line Counter (increment) -> auto-walk through all scenes.
 
-Формат JSON:
+JSON format:
 {
   "prefix": "[QUALITY] ...\\n[STYLE] ...",
   "prompts": [
@@ -20,10 +20,10 @@ JSON-«книга сцен»: общий префикс ([QUALITY]/[STYLE]) + с
     }
   ]
 }
-Элемент списка может быть и просто строкой (тогда char_points пустой).
-horizontal: true = горизонтальный (landscape), false = вертикальный (portrait).
-Можно строкой "format"/"ratio": "16:9"/"9:16". Не задано -> default_horizontal.
-Ключи-синонимы: prompts|scenes, prompt|body, char_points|points,
+A list element can also be just a string (then char_points is empty).
+horizontal: true = horizontal (landscape), false = vertical (portrait).
+Can also be a string "format"/"ratio": "16:9"/"9:16". Unset -> default_horizontal.
+Synonym keys: prompts|scenes, prompt|body, char_points|points,
 horizontal|landscape, format|ratio|orientation.
 """
 
@@ -32,9 +32,9 @@ import os
 
 
 def _parse_orientation(p):
-    """Ориентация сцены -> True (горизонт) / False (вертикаль) / None (не задано).
+    """Scene orientation -> True (horizontal) / False (vertical) / None (unset).
 
-    Принимает bool `horizontal`/`landscape` или строку `format`/`ratio`
+    Accepts a bool `horizontal`/`landscape` or a string `format`/`ratio`
     (16:9 / landscape / wide -> True; 9:16 / portrait / vertical -> False).
     """
     for k in ("horizontal", "landscape"):
@@ -49,9 +49,9 @@ def _parse_orientation(p):
 
 
 def _coerce_prompts(data):
-    """dict из JSON -> (prefix, [ {name, prompt, char_points, horizontal}, ... ]).
+    """JSON dict -> (prefix, [ {name, prompt, char_points, horizontal}, ... ]).
 
-    horizontal: True/False/None (None = не задано, нода подставит дефолт).
+    horizontal: True/False/None (None = unset, the node fills in the default).
     """
     prefix = str(data.get("prefix") or "").strip()
     raw = data.get("prompts") or data.get("scenes") or []
@@ -72,11 +72,11 @@ def _coerce_prompts(data):
 
 
 def load_scene_book(raw, index, wrap=False, default_horizontal=False):
-    """raw — путь к .json ИЛИ сам JSON-текст. index — 1-based.
+    """raw — path to a .json OR the JSON text itself. index — 1-based.
 
-    wrap: True -> индекс зацикливается по длине (для счётчика-increment),
-          False -> зажимается в [1, count].
-    default_horizontal: значение, если сцена не задала ориентацию.
+    wrap: True -> index wraps around by length (for an increment counter),
+          False -> clamped to [1, count].
+    default_horizontal: value used if a scene did not set its orientation.
     -> dict(prefix, prompt, full_prompt, char_points, name, count, index,
             horizontal).
     """
@@ -89,7 +89,7 @@ def load_scene_book(raw, index, wrap=False, default_horizontal=False):
     prefix, items = _coerce_prompts(data)
     count = len(items)
     if count == 0:
-        raise ValueError("[SceneBook] в JSON нет промптов ('prompts': [...])")
+        raise ValueError("[SceneBook] no prompts in the JSON ('prompts': [...])")
 
     if wrap:
         idx = ((int(index) - 1) % count) + 1
@@ -109,24 +109,24 @@ def load_scene_book(raw, index, wrap=False, default_horizontal=False):
 
 
 class UnblendSceneBook:
-    """JSON-сцены (префикс + список {prompt, char_points}) -> по индексу."""
+    """JSON scenes (prefix + list of {prompt, char_points}) -> by index."""
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                # путь к .json ИЛИ оставь пустым и вставь JSON в inline_json
+                # path to a .json OR leave empty and paste JSON into inline_json
                 "json_path": ("STRING", {"default": "scenes.json"}),
-                # какая сцена по счёту (1-based)
+                # which scene by count (1-based)
                 "index": ("INT", {"default": 1, "min": 1, "max": 99999}),
-                # True: индекс зацикливается по длине (пара со счётчиком)
+                # True: index wraps around by length (pairs with the counter)
                 "wrap": ("BOOLEAN", {"default": True}),
-                # ориентация по умолчанию, если сцена её не задала
-                # (True = горизонтальный/landscape, False = вертикальный/portrait)
+                # default orientation if the scene did not set one
+                # (True = horizontal/landscape, False = vertical/portrait)
                 "default_horizontal": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                # альтернатива файлу: вставить JSON прямо сюда
+                # alternative to a file: paste JSON right here
                 "inline_json": ("STRING", {"multiline": True, "default": ""}),
             },
         }
@@ -136,13 +136,13 @@ class UnblendSceneBook:
     RETURN_NAMES = ("prefix", "prompt", "full_prompt", "char_points",
                     "name", "count", "horizontal", "info")
     OUTPUT_TOOLTIPS = (
-        "только префикс [QUALITY]/[STYLE]",
-        "только тело сцены (без префикса)",
-        "префикс + тело (готовый промпт)",
-        "char_points этой сцены",
-        "имя сцены", "всего сцен",
-        "рекомендуемый формат: True = горизонтальный, False = вертикальный",
-        "лог: i/N: имя")
+        "prefix only [QUALITY]/[STYLE]",
+        "scene body only (no prefix)",
+        "prefix + body (ready prompt)",
+        "this scene's char_points",
+        "scene name", "total scenes",
+        "recommended format: True = horizontal, False = vertical",
+        "log: i/N: name")
     FUNCTION = "run"
     CATEGORY = "Unblend"
 
@@ -151,7 +151,7 @@ class UnblendSceneBook:
         raw = inline_json.strip() if inline_json.strip() else json_path
         r = load_scene_book(raw, index, wrap=wrap,
                             default_horizontal=default_horizontal)
-        ori = "гориз" if r["horizontal"] else "вертик"
+        ori = "horiz" if r["horizontal"] else "vert"
         info = f"{r['index']}/{r['count']}: {r['name']} [{ori}]"
         print(f"[UnblendSceneBook] {info}")
         return (r["prefix"], r["prompt"], r["full_prompt"], r["char_points"],
