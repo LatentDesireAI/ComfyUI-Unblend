@@ -35,6 +35,12 @@ Most rules were derived from real bugs while building 2+ character scenes.
 
 2. **Don't write `1girl` in `[CHARn]`** — the node sets `2girls` itself (the
    counter is added automatically from `subject_word` + the number of characters).
+   *Mixed-gender cast?* Put a comma list in `subject_word`, in `[CHARn]` order:
+   `girl, boy` → CHAR1 counts as `1girl`, CHAR2 as `1boy` (a short list pads with
+   the last word). The draw count becomes a booru `1girl, 1boy`, and each
+   character's refine pass uses its own `1girl` / `1boy` — so a boy isn't pushed
+   female by a global `1girl`. A single word still applies to everyone
+   (`girl` → `2girls`).
 
 3. **`[BODY]` doesn't work in Dynamic** — write body words (`petite`,
    `small breasts`) briefly, directly into each `[CHARn]`.
