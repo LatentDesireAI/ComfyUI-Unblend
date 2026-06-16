@@ -129,8 +129,9 @@ In theory it goes up to 4 characters — just write `[CHAR1]` … `[CHAR2]` …
 `[CHAR3]` … `[CHAR4]`. For my own work I keep it to 2 for now.
 
 So here they are — a lazy person's shortcuts that might make your generations a
-little easier. If this helped, I'd be glad for any little bit via Ko-fi 😋 — I
-burned a lot of time and tokens dialing in the result.
+little easier. If this helped, I'd be glad for any little bit via
+[Ko-fi](https://ko-fi.com/latentdesire) 😋 — I burned a lot of time and tokens
+dialing in the result.
 
 Best regards, Alex
 
