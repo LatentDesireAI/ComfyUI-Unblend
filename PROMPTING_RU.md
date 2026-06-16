@@ -286,7 +286,7 @@ CHAR1 = columbina слева (`x=0.32`), CHAR2 = fischl справа (`x=0.68`);
   `false` = вертикальный (portrait). Правило: лежат / широкая пара / вид сверху
   → `true`; стоят / сидят близко / крупный план → `false`.
 - `name` — человекочитаемая метка (локация/действие).
-- Готовый шаблон: `example_workflows/scenes_columbina_fischl.json`.
+- Готовый шаблон: `example_workflows/scenes_demo.json`.
 
 Юзер кладёт JSON в ноду (путь или inline), гоняет по `index` (или со счётчиком +
 `wrap`), получает `full_prompt` + `char_points` для пайплайна.

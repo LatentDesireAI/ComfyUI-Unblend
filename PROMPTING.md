@@ -292,7 +292,7 @@ Output rules:
   `false` = vertical (portrait). Rule: lying / wide pair / top view
   → `true`; standing / sitting close / close-up → `false`.
 - `name` — a human-readable label (location/action).
-- Ready template: `example_workflows/scenes_columbina_fischl.json`.
+- Ready template: `example_workflows/scenes_demo.json`.
 
 The user puts the JSON into the node (path or inline), runs it by `index` (or with a counter +
 `wrap`), and gets `full_prompt` + `char_points` for the pipeline.

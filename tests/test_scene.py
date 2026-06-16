@@ -94,7 +94,7 @@ except ValueError:
     check("empty list -> error", True)
 
 # example JSON from the repo is valid and readable
-ex = os.path.join(FOLDER, "example_workflows", "scenes_columbina_fischl.json")
+ex = os.path.join(FOLDER, "example_workflows", "scenes_demo.json")
 if os.path.isfile(ex):
     re = sn.load_scene_book(ex, 1)   # file path, not text
     check("example JSON: readable by path", re["count"] == 4, str(re["count"]))

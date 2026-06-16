@@ -1,0 +1,29 @@
+{
+  "prefix": "[QUALITY] masterpiece, best quality, ultra detailed, absurdres, cel shaded, (correct anatomy:1.2)\n[STYLE] glossy skin, detailed hair, intricate details, very aesthetic, premium anime illustration",
+  "prompts": [
+    {
+      "name": "beach midday (top-down, lying)",
+      "prompt": "[SCENE] sunny beach at midday, white sand, beach towels, clear blue sky, turquoise sea\n[CHAR1] raiden shogun \\(genshin impact\\), long braid, very long purple hair, purple eyes, mature female, tall, (purple sundress:1.15), relaxed, lying on towel\n[CHAR2] ningguang \\(genshin impact\\), hair stick, long white hair, red eyes, mature female, tall, (white sundress:1.15), soft smile, lying on towel\n[CAMERA] from above, overhead view, looking down, straight-on, level horizon, bright sunlight, (volumetric lighting:1.2), (water caustics:1.1)\n[INTERACT] lying side by side on towels, holding hands, heads close, same height, relaxed",
+      "char_points": "0.35,0.35; 0.65,0.35",
+      "horizontal": true
+    },
+    {
+      "name": "beach parasol (shade, sitting)",
+      "prompt": "[SCENE] beach under a large parasol, dappled shade, white sand, bright sea behind, summer\n[CHAR1] raiden shogun \\(genshin impact\\), long braid, very long purple hair, purple eyes, mature female, tall, (purple sundress:1.15), soft smile, sitting\n[CHAR2] ningguang \\(genshin impact\\), hair stick, long white hair, red eyes, mature female, tall, (white sundress:1.15), sly smile, sitting\n[CAMERA] eye level, straight-on view, level horizon, soft shade lighting, bright sun rim, (volumetric lighting:1.2), (bokeh:1.1)\n[INTERACT] sitting close under the parasol, ningguang resting head on raiden's shoulder, arms linked, same height",
+      "char_points": "0.36,0.42; 0.64,0.42",
+      "horizontal": false
+    },
+    {
+      "name": "beach bonfire (night)",
+      "prompt": "[SCENE] night beach with a bonfire, starry sky, dark sea, distant horizon lights\n[CHAR1] raiden shogun \\(genshin impact\\), long braid, very long purple hair, purple eyes, mature female, tall, (purple sundress:1.15), blanket over shoulders, calm, sitting\n[CHAR2] ningguang \\(genshin impact\\), hair stick, long white hair, red eyes, mature female, tall, (white sundress:1.15), soft gaze, sitting\n[CAMERA] eye level, level horizon, warm firelight from below, (bonfire glow:1.25), (chiaroscuro:1.2), cool moonlight rim, (volumetric lighting:1.25)\n[INTERACT] sitting close by the fire, wrapped together in one blanket, cheek to cheek, same height, cozy",
+      "char_points": "0.36,0.43; 0.64,0.43",
+      "horizontal": false
+    },
+    {
+      "name": "beach surf (splashing)",
+      "prompt": "[SCENE] beach shoreline, breaking waves, sea foam, bright overcast sky\n[CHAR1] raiden shogun \\(genshin impact\\), long braid, very long purple hair, purple eyes, mature female, tall, (purple sundress:1.15), surprised, standing on the shore\n[CHAR2] ningguang \\(genshin impact\\), hair stick, long white hair, red eyes, mature female, tall, (white sundress:1.15), laughing, standing on the shore\n[CAMERA] eye level, straight-on view, level horizon, bright diffused light, (water splash:1.2), (sea spray:1.1), (volumetric lighting:1.2)\n[INTERACT] standing on the shore, ningguang splashing raiden, holding each other, same height, playful, laughing",
+      "char_points": "0.33,0.4; 0.67,0.4",
+      "horizontal": false
+    }
+  ]
+}
