@@ -1,36 +1,36 @@
 """
 ComfyUI-Unblend :: pose_engine.py
 ==================================
-UnblendPoseEngine — нода выбора движка позы для пайплайна.
+UnblendPoseEngine — a node to pick the pose engine for the pipeline.
 
-Два бэкенда:
-  dwpose       — текущий (imgutils.pose.dwpose_estimate).
-                 Обучен на COCO (реальные люди). Аниме-стилизованные
-                 пропорции (большая голова, длинные ноги) детектирует плохо.
+Two backends:
+  dwpose       — the current one (imgutils.pose.dwpose_estimate).
+                 Trained on COCO (real people). Anime-stylized
+                 proportions (big head, long legs) are detected poorly.
 
   rtmlib_humanart — RTMPose-m (halpe26) + YOLOX-m-HumanArt (rtmlib BodyWithFeet).
-                 Обучен на 7 датасетах ВКЛЮЧАЯ HumanArt (рисованные/мульт-
-                 персонажи). Детектирует и реальных людей, И аниме.
-                 Это решает «рассыпанный скелет» на аниме одним переключателем.
+                 Trained on 7 datasets INCLUDING HumanArt (drawn / cartoon
+                 characters). Detects both real people AND anime.
+                 This fixes the "scattered skeleton" on anime with one switch.
 
-Выходы совместимы с DeepghsCharSeg (detect_target="pose"):
-  pose_image : IMAGE  — OpenPose RGB (все персонажи) для ControlNet
-  bodies_json: STRING — JSON [{box, seed, points, conf, body18}] для
-                        person_boxes_from_heads_fg / watershed-сидов
+Outputs are compatible with DeepghsCharSeg (detect_target="pose"):
+  pose_image : IMAGE  — OpenPose RGB (all characters) for ControlNet
+  bodies_json: STRING — JSON [{box, seed, points, conf, body18}] for
+                        person_boxes_from_heads_fg / watershed seeds
 
-Поддержка парных (duo) артов:
-  - Используй det_conf 0.25-0.4 для rtmlib (чтобы детектор не отбрасывал второго).
-  - Лучше всего: подключи out_bboxes_json от твоего детектора персонажей
-    (DeepghsCharSeg, AnimeCharDetectSeg и т.д.). Тогда rtmlib посчитает
-    отдельную позу строго для каждого переданного бокса — "по одному скелету на персонажа".
+Duo art support:
+  - Use det_conf 0.25-0.4 for rtmlib (so the detector doesn't drop the second one).
+  - Best of all: pass out_bboxes_json from your character detector
+    (DeepghsCharSeg, AnimeCharDetectSeg, etc.). Then rtmlib computes a
+    separate pose strictly for each given box — "one skeleton per character".
 
-Зависимости:
-  dwpose       : уже есть через dghs-imgutils (imgutils.pose)
-  rtmlib_humanart: pip install rtmlib   (onnxruntime-based, без mmcv)
-                   Веса качаются авто с HF при первом запуске.
-                   В ноде есть дропдаун device (cpu по умолчанию / cuda).
-                   При проблемах с CUDA EP (cublasLt64_12.dll missing на cu130/RTX50xx) —
-                   нода автоматически работает на CPU и пишет понятное сообщение один раз.
+Dependencies:
+  dwpose       : already available via dghs-imgutils (imgutils.pose)
+  rtmlib_humanart: pip install rtmlib   (onnxruntime-based, no mmcv)
+                   Weights download automatically from HF on first run.
+                   The node has a device dropdown (cpu by default / cuda).
+                   On CUDA EP issues (cublasLt64_12.dll missing on cu130/RTX50xx) —
+                   the node automatically runs on CPU and prints a clear message once.
 """
 
 import json
@@ -40,7 +40,7 @@ import os
 import numpy as np
 import torch
 
-# ── OpenPose рендерер (копия из deepghs_nodes.py, не импортируем чтоб не циклить) ─
+# ── OpenPose renderer (a copy from deepghs_nodes.py, not imported to avoid a cycle) ─
 _OP18_LIMBS = [[1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8],
                [8, 9], [9, 10], [1, 11], [11, 12], [12, 13], [1, 0],
                [0, 14], [14, 16], [0, 15], [15, 17]]
@@ -52,7 +52,7 @@ _OP18_COLORS = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0],
 
 
 def render_openpose18(h, w, bodies, point_conf=0.3):
-    """bodies: список (18,3) [x,y,score] -> np.uint8 RGB."""
+    """bodies: list of (18,3) [x,y,score] -> np.uint8 RGB."""
     import cv2
     canvas = np.zeros((h, w, 3), dtype=np.uint8)
     for body in bodies:
@@ -87,14 +87,14 @@ def _tensor_to_pil(image_tensor):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# БЭКЕНД 1: DWPose (imgutils, текущий)
+# BACKEND 1: DWPose (imgutils, the current one)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _run_dwpose(pil, out_bboxes=None, point_conf=0.3):
-    """DWPose через imgutils.pose.dwpose_estimate.
-    out_bboxes — явные боксы тел (от силуэта+голов), чтобы не запускать
-    внутренний детект (который на аниме даёт кривые боксы).
-    Возвращает список dict: {box, seed, points, conf, body18}.
+    """DWPose via imgutils.pose.dwpose_estimate.
+    out_bboxes — explicit body boxes (from silhouette+heads) to avoid running
+    the internal detect (which gives skewed boxes on anime).
+    Returns a list of dicts: {box, seed, points, conf, body18}.
     """
     from imgutils.pose import dwpose_estimate
 
@@ -121,24 +121,24 @@ def _run_dwpose(pil, out_bboxes=None, point_conf=0.3):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# БЭКЕНД 2: rtmlib + HumanArt
+# BACKEND 2: rtmlib + HumanArt
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Кеш для rtmlib детектора (det + pose). Ключ = (device, det_conf) чтобы разные пороги не ломали кеш.
+# Cache for the rtmlib detector (det + pose). Key = (device, det_conf) so different thresholds don't break the cache.
 _rtmlib_cache = {}
 
-# Флаг, чтобы предупреждение про CUDA/cuDNN выводить только один раз
+# Flag so the CUDA/cuDNN warning is printed only once
 _rtmlib_cuda_warned = False
 
 
 def _get_rtmlib_models(device="cpu", det_conf=0.3):
-    """Возвращает (det_model, pose_model) для rtmlib HumanArt/halpe26.
+    """Returns (det_model, pose_model) for rtmlib HumanArt/halpe26.
 
-    Мы создаём YOLOX и RTMPose напрямую (а не BodyWithFeet), чтобы:
-      - контролировать score_thr детектора (по умолчанию в rtmlib 0.7 — слишком высоко для парных артов)
-      - поддерживать out_bboxes (принудительные боксы персонажей)
+    We build YOLOX and RTMPose directly (not BodyWithFeet) so we can:
+      - control the detector score_thr (rtmlib defaults to 0.7 — too high for duo art)
+      - support out_bboxes (forced character boxes)
 
-    Используем те же веса, что и balanced в BodyWithFeet.
+    We use the same weights as 'balanced' in BodyWithFeet.
     """
     key = (device, round(float(det_conf), 2))
     if key in _rtmlib_cache:
@@ -148,12 +148,12 @@ def _get_rtmlib_models(device="cpu", det_conf=0.3):
         from rtmlib import BodyWithFeet, YOLOX, RTMPose
     except ImportError:
         raise ImportError(
-            "[UnblendPoseEngine] rtmlib не установлен.\n"
-            "Активируй venv ComfyUI и выполни:\n"
+            "[UnblendPoseEngine] rtmlib is not installed.\n"
+            "Activate the ComfyUI venv and run:\n"
             "  pip install rtmlib"
         )
 
-    # Берём точные URL и размеры из rtmlib, чтобы не хардкодить
+    # Take exact URLs and sizes from rtmlib instead of hardcoding
     balanced = BodyWithFeet.MODE["balanced"]
     det_url = balanced["det"]
     det_size = balanced["det_input_size"]
@@ -164,7 +164,7 @@ def _get_rtmlib_models(device="cpu", det_conf=0.3):
         det_url,
         model_input_size=det_size,
         mode="human",
-        score_thr=float(det_conf),   # <--- главное для парных артов (ниже 0.7)
+        score_thr=float(det_conf),   # <--- key for duo art (below 0.7)
         nms_thr=0.45,
         backend="onnxruntime",
         device=device,
@@ -177,7 +177,7 @@ def _get_rtmlib_models(device="cpu", det_conf=0.3):
         device=device,
     )
 
-    # Проверка CUDA-провайдера (как раньше)
+    # Check the CUDA provider (as before)
     global _rtmlib_cuda_warned
     try:
         det_sess = getattr(det_model, "session", None)
@@ -190,13 +190,13 @@ def _get_rtmlib_models(device="cpu", det_conf=0.3):
 
         if device == "cuda" and "CUDAExecutionProvider" not in used:
             if not _rtmlib_cuda_warned:
-                print("[UnblendPoseEngine] ВНИМАНИЕ: device=cuda, но onnxruntime не смог инициализировать CUDAExecutionProvider.")
-                print("  Ошибка: cublasLt64_12.dll (и/или cuDNN 9 + CUDA 12 requirement).")
-                print("  Твоё окружение (torch cu130 dev + RTX 5080) часто вызывает это.")
-                print("  rtmlib_humanart будет работать на CPU (качество хорошее для аниме, скорость ниже).")
-                print("  В ноде UnblendPoseEngine теперь есть дропдаун device — по умолчанию стоит cpu.")
-                print("  Чтобы убрать спам ошибок и получить GPU: почини onnxruntime-gpu под CUDA 12/cuDNN9")
-                print("  (см. https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements)")
+                print("[UnblendPoseEngine] WARNING: device=cuda, but onnxruntime could not initialize CUDAExecutionProvider.")
+                print("  Error: cublasLt64_12.dll (and/or the cuDNN 9 + CUDA 12 requirement).")
+                print("  Your environment (torch cu130 dev + RTX 5080) often triggers this.")
+                print("  rtmlib_humanart will run on CPU (quality is good for anime, speed is lower).")
+                print("  The UnblendPoseEngine node now has a device dropdown — it defaults to cpu.")
+                print("  To stop the error spam and get the GPU: fix onnxruntime-gpu for CUDA 12/cuDNN9")
+                print("  (see https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#requirements)")
                 _rtmlib_cuda_warned = True
     except Exception:
         pass
@@ -205,15 +205,15 @@ def _get_rtmlib_models(device="cpu", det_conf=0.3):
     return det_model, pose_model
 
 
-# Маппинг rtmlib 17-точечного COCO-формата -> OP18 (OpenPose 18 точек)
-# Модель halpe26 возвращает 26 точек, но индексы 0..16 совпадают с COCO-17:
+# Mapping rtmlib's 17-point COCO format -> OP18 (OpenPose 18 points)
+# The halpe26 model returns 26 points, but indices 0..16 match COCO-17:
 # [nose, l_eye, r_eye, l_ear, r_ear, l_shoulder, r_shoulder, l_elbow, r_elbow,
 #  l_wrist, r_wrist, l_hip, r_hip, l_knee, r_knee, l_ankle, r_ankle]
 # OP18:           [nose(0), neck(1), r_shoulder(2), r_elbow(3), r_wrist(4),
 #                  l_shoulder(5), l_elbow(6), l_wrist(7), r_hip(8),
 #                  r_knee(9), r_ankle(10), l_hip(11), l_knee(12), l_ankle(13),
 #                  r_eye(14), l_eye(15), r_ear(16), l_ear(17)]
-# neck(1) = среднее l_shoulder(5 coco) + r_shoulder(6 coco)
+# neck(1) = average of l_shoulder(5 coco) + r_shoulder(6 coco)
 
 _COCO17_TO_OP18 = {
     0:  0,   # nose
@@ -240,9 +240,9 @@ _COCO17_TO_OP18 = {
 def _coco17_to_op18(keypoints, scores, img_w, img_h):
     """rtmlib keypoints (17+,2) + scores (17+,) -> OP18 array (18,3) [x,y,conf].
 
-    Для halpe26 модели используем индексы 0-16 (они = COCO17).
-    Координаты rtmlib — пиксельные. Конвертируем к [0..img_w] / [0..img_h].
-    Neck вычисляется как среднее между l_shoulder(5) и r_shoulder(6).
+    For the halpe26 model we use indices 0-16 (they = COCO17).
+    rtmlib coordinates are in pixels. We convert to [0..img_w] / [0..img_h].
+    Neck is computed as the average of l_shoulder(5) and r_shoulder(6).
     """
     op18 = np.zeros((18, 3), dtype=np.float32)
     for coco_idx, op_idx in _COCO17_TO_OP18.items():
@@ -266,15 +266,15 @@ def _coco17_to_op18(keypoints, scores, img_w, img_h):
 
 
 def _run_rtmlib_humanart(pil, point_conf=0.3, device="cpu", det_conf=0.3, out_bboxes=None):
-    """RTMPose + HumanArt (halpe26) с поддержкой нескольких персонажей.
+    """RTMPose + HumanArt (halpe26) with multi-character support.
 
-    - det_conf — порог детектора YOLOX (по умолчанию 0.3, ниже чем 0.7 в rtmlib).
-      Для парных/групповых артов понижай до 0.25-0.4, чтобы ловить второго персонажа.
-    - out_bboxes — если переданы (из DeepghsCharSeg / AnimeCharDetectSeg и т.п.),
-      то детектор пропускается, и pose считается строго по этим боксам.
-      Это лучший способ для парных артов: сначала найди персонажей → возьми их bbox → точные позы.
+    - det_conf — the YOLOX detector threshold (default 0.3, lower than rtmlib's 0.7).
+      For duo/group art lower it to 0.25-0.4 to catch the second character.
+    - out_bboxes — if provided (from DeepghsCharSeg / AnimeCharDetectSeg, etc.),
+      the detector is skipped and the pose is computed strictly from these boxes.
+      Best for duo art: first find the characters -> take their bbox -> precise poses.
 
-    Возвращает список dict: {box, seed, points, conf, body18}.
+    Returns a list of dicts: {box, seed, points, conf, body18}.
     """
     import cv2
     from urllib.error import HTTPError, URLError
@@ -288,11 +288,11 @@ def _run_rtmlib_humanart(pil, point_conf=0.3, device="cpu", det_conf=0.3, out_bb
     try:
         if out_bboxes and len(out_bboxes) > 0:
             bboxes = [list(map(float, bb)) for bb in out_bboxes]
-            print(f"[UnblendPoseEngine] rtmlib: используем {len(bboxes)} предоставленных боксов (out_bboxes), детектор пропущен.")
+            print(f"[UnblendPoseEngine] rtmlib: using {len(bboxes)} provided boxes (out_bboxes), detector skipped.")
         else:
             bboxes = det_model(img_bgr)
 
-        # pose_model сам сделает кропы под 192x256 и вернёт keypoints в координатах исходного img_bgr
+        # pose_model crops to 192x256 itself and returns keypoints in the original img_bgr coordinates
         keypoints_all, scores_all = pose_model(img_bgr, bboxes=bboxes)
     except (HTTPError, URLError) as e:
         print(f"[UnblendPoseEngine] rtmlib HTTP error: {e}")
@@ -303,7 +303,7 @@ def _run_rtmlib_humanart(pil, point_conf=0.3, device="cpu", det_conf=0.3, out_bb
 
     out = []
     for kps, scs in zip(keypoints_all, scores_all):
-        # kps/scs уже в нативном разрешении img (w,h)
+        # kps/scs are already in the native img resolution (w,h)
         op18 = _coco17_to_op18(np.array(kps), scs, w, h)
         valid = op18[op18[:, 2] > point_conf]
         if valid.shape[0] == 0:
@@ -325,39 +325,39 @@ def _run_rtmlib_humanart(pil, point_conf=0.3, device="cpu", det_conf=0.3, out_bb
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Нода ComfyUI
+# ComfyUI node
 # ══════════════════════════════════════════════════════════════════════════════
 
 class UnblendPoseEngine:
-    """Извлечение позы из аниме-арта с выбором движка.
+    """Pose extraction from anime art with an engine choice.
 
     pose_engine:
-      dwpose           — imgutils DWPose (COCO, реальные люди). Текущий стандарт.
-      rtmlib_humanart  — RTMPose halpe26 + HumanArt (видит аниме). Рекомендуется для аниме.
-                         Лучше ловит аниме-пропорции (большая голова, длинные ноги и т.д.).
+      dwpose           — imgutils DWPose (COCO, real people). The current standard.
+      rtmlib_humanart  — RTMPose halpe26 + HumanArt (sees anime). Recommended for anime.
+                         Catches anime proportions better (big head, long legs, etc.).
 
     device:
-      cpu (по умолчанию) — безопасно, без ошибок onnxruntime CUDA.
-      cuda               — пытается использовать GPU через onnxruntime.
-                         На CUDA 13 dev / RTX 50xx часто падает с "cublasLt64_12.dll missing".
-                         В этом случае нода автоматически работает на CPU и один раз пишет
-                         подробное предупреждение в консоль. Качество остаётся высоким.
+      cpu (default)    — safe, no onnxruntime CUDA errors.
+      cuda             — tries to use the GPU via onnxruntime.
+                         On CUDA 13 dev / RTX 50xx it often fails with "cublasLt64_12.dll missing".
+                         In that case the node automatically runs on CPU and prints a
+                         detailed warning to the console once. Quality stays high.
 
-    det_conf (только для rtmlib_humanart):
-      Порог детектора YOLOX. По умолчанию 0.3 (в оригинальном rtmlib было 0.7).
-      Для парных артов (2+ персонажа) понижай до 0.25–0.4, чтобы второй персонаж не пропадал.
-      Если используешь out_bboxes_json (боксы от DeepghsCharSeg / AnimeCharDetectSeg),
-      детектор вообще не запускается — позы считаются точно по твоим боксам персонажей.
-      Это лучший способ для duo/trio артов.
+    det_conf (rtmlib_humanart only):
+      The YOLOX detector threshold. Default 0.3 (the original rtmlib used 0.7).
+      For duo art (2+ characters) lower it to 0.25-0.4 so the second character isn't dropped.
+      If you use out_bboxes_json (boxes from DeepghsCharSeg / AnimeCharDetectSeg),
+      the detector does not run at all — poses are computed exactly from your character boxes.
+      This is the best way for duo/trio art.
 
     out_bboxes_json:
-      Подключи сюда боксы из твоего детектора персонажей.
-      Тогда для rtmlib и dwpose будут извлечены позы именно для этих регионов (гарантия "по одному на персонажа").
+      Wire the boxes from your character detector here.
+      Then rtmlib and dwpose extract poses for exactly these regions (a "one per character" guarantee).
 
-    Выходы:
-      pose_image  : IMAGE  — OpenPose RGB (все скелеты на одном изображении) для ControlNet
-      bodies_json : STRING — JSON-список тел (box/seed/points/conf/body18)
-                             совместим с DeepghsCharSeg detect_target=pose
+    Outputs:
+      pose_image  : IMAGE  — OpenPose RGB (all skeletons on one image) for ControlNet
+      bodies_json : STRING — a JSON list of bodies (box/seed/points/conf/body18)
+                             compatible with DeepghsCharSeg detect_target=pose
     """
 
     ENGINES = ["rtmlib_humanart", "dwpose"]
@@ -378,8 +378,8 @@ class UnblendPoseEngine:
                                               "max": 2048, "step": 64}),
             },
             "optional": {
-                # явные боксы тел от DeepghsCharSeg / person_boxes_from_heads_fg
-                # (если подключены — пропускаем внутренний детект)
+                # explicit body boxes from DeepghsCharSeg / person_boxes_from_heads_fg
+                # (if connected — we skip the internal detect)
                 "out_bboxes_json": ("STRING", {"default": ""}),
             },
         }
@@ -395,16 +395,16 @@ class UnblendPoseEngine:
         pil = _tensor_to_pil(image)
         w, h = pil.size
 
-        # Разбор явных боксов (если поданы извне) — теперь используется и rtmlib, и dwpose
+        # Parse explicit boxes (if passed in) — now used by both rtmlib and dwpose
         out_bboxes = None
         if out_bboxes_json and out_bboxes_json.strip():
             try:
                 parsed = json.loads(out_bboxes_json)
-                # формат может быть как список боксов, так и meta-dict от DetectSeg
+                # the format can be either a list of boxes or a meta-dict from DetectSeg
                 if isinstance(parsed, dict) and "instances" in parsed:
                     out_bboxes = [inst["bbox"] for inst in parsed["instances"]]
                 elif isinstance(parsed, list):
-                    # каждый элемент — либо bbox-список, либо dict с "bbox"
+                    # each element is either a bbox list or a dict with "bbox"
                     out_bboxes = []
                     for item in parsed:
                         if isinstance(item, dict) and "bbox" in item:
@@ -412,12 +412,12 @@ class UnblendPoseEngine:
                         elif isinstance(item, (list, tuple)) and len(item) == 4:
                             out_bboxes.append(list(item))
             except Exception as e:
-                print(f"[UnblendPoseEngine] Ошибка разбора out_bboxes_json: {e}")
+                print(f"[UnblendPoseEngine] Failed to parse out_bboxes_json: {e}")
 
-        # ── Источник боксов: головы + силуэт (надёжно для duo) ────────────────
-        # YOLOX-детектор rtmlib при нахлёсте тел схлопывает двоих в один бокс
-        # (NMS) -> одна поза. Головы не мёржатся, силуэт даёт тело -> по боксу
-        # на персонажа. Срабатывает только если боксы не поданы извне.
+        # ── Box source: heads + silhouette (reliable for duo) ─────────────────
+        # When bodies overlap, the rtmlib YOLOX detector collapses two into one
+        # box (NMS) -> a single pose. Heads don't merge, the silhouette gives the
+        # body -> one box per character. Runs only if boxes weren't passed in.
         if out_bboxes is None and box_source == "heads+silhouette":
             try:
                 from .deepghs_nodes import (
@@ -429,13 +429,13 @@ class UnblendPoseEngine:
                 heads, hconf = _dedup_boxes(heads, hconf, 0.05 * min(w, h))
                 if heads:
                     out_bboxes = person_boxes_from_heads_fg(fg, heads, w, h)
-                    print(f"[UnblendPoseEngine] боксы из голов+силуэта: {len(out_bboxes)} "
-                          f"(голов найдено: {len(heads)})")
+                    print(f"[UnblendPoseEngine] boxes from heads+silhouette: {len(out_bboxes)} "
+                          f"(heads found: {len(heads)})")
             except Exception as e:
-                print(f"[UnblendPoseEngine] heads+silhouette не сработал ({e}), "
-                      f"откат на внутренний детектор")
+                print(f"[UnblendPoseEngine] heads+silhouette failed ({e}), "
+                      f"falling back to the internal detector")
 
-        # ── Запуск движка ─────────────────────────────────────────────────────
+        # ── Run the engine ────────────────────────────────────────────────────
         if pose_engine == "rtmlib_humanart":
             try:
                 bodies = _run_rtmlib_humanart(pil, point_conf=point_conf,
@@ -443,15 +443,15 @@ class UnblendPoseEngine:
                                                out_bboxes=out_bboxes)
             except ImportError as e:
                 print(f"[UnblendPoseEngine] {e}")
-                print("[UnblendPoseEngine] Откат на DWPose.")
+                print("[UnblendPoseEngine] Falling back to DWPose.")
                 bodies = _run_dwpose(pil, out_bboxes=out_bboxes,
                                      point_conf=point_conf)
         else:  # dwpose
             bodies = _run_dwpose(pil, out_bboxes=out_bboxes,
                                  point_conf=point_conf)
 
-        # ── OpenPose-рендер → pose_image ──────────────────────────────────────
-        # Рендерим в размере исходного изображения, затем ресайзим до canvas_size
+        # ── OpenPose render -> pose_image ─────────────────────────────────────
+        # Render at the source image size, then resize to canvas_size
         import cv2
         body18_list = [np.asarray(b["body18"], dtype=np.float32)
                        for b in bodies]
@@ -468,7 +468,7 @@ class UnblendPoseEngine:
         return (pose_tensor, json.dumps(bodies))
 
 
-# ── Регистрация для __init__.py ───────────────────────────────────────────────
+# ── Registration for __init__.py ──────────────────────────────────────────────
 NODE_CLASS_MAPPINGS = {
     "UnblendPoseEngine": UnblendPoseEngine,
 }
