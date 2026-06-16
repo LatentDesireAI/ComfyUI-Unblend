@@ -1,18 +1,121 @@
 # ComfyUI-Unblend
 
-Auto-separation of multiple anime characters in one image **without character
-blending** (hair / clothes / eyes bleeding between subjects in 2+ character
-art). Built for SDXL / Illustrious and compatible finetunes.
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![ComfyUI Registry](https://img.shields.io/badge/ComfyUI-Registry-1971c2.svg)](https://registry.comfy.org/publishers/latentdesireai/nodes/comfyui-unblend)
 
-Idea: locate each character (even when bodies overlap — hugging, kissing),
-get a clean per-character mask, turn the masks into mutually-exclusive regions,
-and feed them to regional attention. Plus utilities that remove the manual
-grind (prompt books, poses, line counter).
+**Auto-separation of multiple anime characters in one image — no hand-drawn
+masks, no regional-prompting spaghetti.** Built for SDXL / Illustrious and
+compatible finetunes.
 
-> 📝 How to write tagged prompts (`[CHARn]` etc.), ready examples and
-> troubleshooting — see **[PROMPTING.md](PROMPTING.md)**.
+## The problem
 
----
+You write a prompt for two characters and hit generate. Then it happens: their
+hair colors mix, the eyepatch jumps to the wrong face, one character's signature
+accessory ends up on the other — and at worst you get "twins," two people with
+the same face. The closer they are (hugging, kissing, leaning on each other),
+the worse it gets.
+
+The usual fix is regional prompting with a pile of hand-drawn masks. It works,
+but it's slow, fiddly, and falls apart on busy scenes. **Unblend removes that
+manual grind: you just write the prompt.** The nodes find each character, build
+clean per-character masks automatically, turn them into mutually-exclusive
+regions, and feed those to regional attention. No hand-drawing.
+
+## Before / after
+
+A hard case on purpose: **Ningguang × Shenhe** (Genshin Impact) — two
+white-haired characters, so a plain sampler blends their faces and swaps their
+accessories. That makes the difference easy to see.
+
+| Standard generation (no masks) | With Unblend |
+|---|---|
+| ![Standard generation](example_workflows/img_demo/03_standard_generation.png) | ![Using Unblend](example_workflows/img_demo/04_using_unblend.png) |
+
+**Left** — a normal prompt on a plain sampler: hair mixes, the forehead jewel
+and hair ornament swap faces. **Right** — the same prompt through Unblend: you
+write the text, the nodes do the masking, and each character stays herself.
+
+## Install
+
+**ComfyUI Manager (recommended).** Open the Manager, search **"Unblend"**, click
+Install, and restart ComfyUI. The Python dependencies install automatically.
+
+**Manual (git):**
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/LatentDesireAI/ComfyUI-Unblend
+pip install -r ComfyUI-Unblend/requirements.txt
+```
+
+Then restart ComfyUI. Install into the same Python environment ComfyUI runs in
+(Windows portable build: `python_embeded\python.exe -m pip install -r
+ComfyUI-Unblend\requirements.txt`).
+
+You also need a **SAM segmentation node** for the hi-res instance masks — it is
+**not** part of ComfyUI core. Install one separately (see
+[Requirements](#requirements)).
+
+## Quick start
+
+Unblend uses **tagged prompts** so it knows what to lock to whom. A minimal
+prompt looks like this:
+
+```
+[QUALITY] masterpiece, best quality, ultra detailed, absurdres
+[STYLE] detailed hair, intricate details, very aesthetic
+[SCENE] beach under a large parasol, white sand, bright sea behind, summer
+[CHAR1] ningguang \(genshin impact\), hair stick, forehead jewel, long white hair, red eyes, (white sundress:1.15), sitting
+[CHAR2] shenhe \(genshin impact\), hair ornament, long white hair, light blue eyes, (pale blue sundress:1.15), sitting
+[INTERACT] sitting close under the parasol, shenhe resting head on ningguang's shoulder, arms linked
+```
+
+```
+char_points = 0.3,0.45; 0.7,0.45
+```
+
+`char_points` are normalized `0..1` anchors on each character's head, in
+`[CHARn]` order. Same `y`, different `x` = side by side; same `x`, different `y`
+= stacked / lying.
+
+Three rules that save the most pain (all learned from real bugs):
+
+1. **Put the other character's name only in `[INTERACT]`**, never inside
+   `[CHARn]` — otherwise it binds to the wrong mask and you get identity mixups.
+2. **Keep each `[CHARn]` compact (~35–45 tokens) and the same length for both** —
+   a long one breaks across the 77-token CLIP boundary, the character gets no
+   mask, and you get a square instead of a silhouette.
+3. **Maximize contrast** between characters (hair / eyes / clothes) — that's what
+   the model tells them apart by.
+
+Scales to 4 characters in theory (`[CHAR1]` … `[CHAR4]`); 2 is the sweet spot in
+practice.
+
+> 📝 Full cheat sheet — token order, `char_points` recipes, and troubleshooting
+> (twins, style drift, traits leaking, disappearing signatures) — is in
+> **[PROMPTING.md](PROMPTING.md)** (Russian: [PROMPTING_RU.md](PROMPTING_RU.md)).
+
+## How it works (in plain terms)
+
+Unblend runs as a **two-pass pipeline**.
+
+**1. Composition pass — Unblend Dynamic Sampler.** Generates both characters in
+a single pass. It rebuilds each character's mask from the model's own
+cross-attention maps every few steps, then keeps her tokens locked inside her
+own zone. No hand-drawn masks needed — the two come out already separated.
+
+![Dynamic Sampler — composition pass](example_workflows/img_demo/01_dynamic_sampler.png)
+
+**2. Detail pass — Unblend Sequential Refine.** Instead of a second KSampler, it
+redraws each character with **only her own `[CHARn]`** (zero neighbour tokens →
+no feature leak), then details the background separately. The result: crisp
+faces, clean accessories, no characters duplicated onto in-scene decor.
+
+![Sequential Refine — hi-res detail](example_workflows/img_demo/02_sequential_refine.png)
+
+Between the two passes, an external **SAM** node produces clean instance masks
+and **Assign Masks** labels them back to the right character using the same
+`char_points`. Everything stays consistent.
 
 ## Nodes
 
@@ -24,8 +127,6 @@ grind (prompt books, poses, line counter).
 | **Unblend Scene Book (JSON prompts)** | JSON "scene book": a shared `prefix` ([QUALITY]/[STYLE]) + a list of prompts, each with its own `char_points` and recommended orientation `horizontal` (true = landscape / false = portrait). By index, outputs `prefix` / `prompt` / `full_prompt` / `char_points` / `name` / `horizontal` separately. `wrap` pairs with the Line Counter for batch runs. Example: `example_workflows/scenes_demo.json`. |
 | **Unblend Line Counter** | Prompt-file line number with auto-advance: repeat / increment / random / fixed. For a "file → stream of arts" pipeline. |
 | **Unblend Pose Engine** | Pose extraction with engine choice: `rtmlib_humanart` (RTMPose + HumanArt — sees anime proportions, recommended) or `dwpose`. Returns an OpenPose image for ControlNet + a JSON of bodies. Can take boxes from a detector ("one skeleton per character"). |
-
----
 
 ## Pipeline
 
@@ -44,72 +145,31 @@ Scene Book (JSON) ─┬─► full_prompt ──► Dynamic Sampler ──► d
   details the background separately — no feature leak, no duplicates on decor.
 - **Scene Book** + **Line Counter** drive a whole prompt collection by index.
 
-A ready example graph: `example_workflows/unblend_workflow_example.json`.
-
----
-
-## Demo
-
-A hard case on purpose: **Ningguang × Shenhe** (Genshin Impact) — two
-white-haired characters, so a plain sampler blends their faces and swaps their
-accessories. That makes the difference easy to see.
-
-### 1. Unblend Dynamic Sampler (Bounded Attention)
-
-![Dynamic Sampler — composition pass](example_workflows/img_demo/01_dynamic_sampler.png)
-
-The composition pass. One prompt with `[CHAR1]` / `[CHAR2]`, one trajectory —
-the node rebuilds each character's mask from the model's own cross-attention
-maps and keeps her tokens inside it. The two are already separated here, with
-**no hand-drawn masks**.
-
-### 2. Unblend Sequential Refine (per-char img2img)
-
-![Sequential Refine — hi-res detail](example_workflows/img_demo/02_sequential_refine.png)
-
-The detail / hi-res pass that replaces a second KSampler. Each character is
-redrawn with **only her own `[CHARn]`** (zero neighbour tokens → no feature
-leak), and the background is detailed separately. Crisp faces, clean accessories.
-
-### Before / after
-
-| Standard generation (no masks) | With Unblend |
-|---|---|
-| ![Standard generation](example_workflows/img_demo/03_standard_generation.png) | ![Using Unblend](example_workflows/img_demo/04_using_unblend.png) |
-
-**Left** — a normal prompt on a plain sampler: Ningguang and Shenhe bleed into
-each other (hair mixes, the forehead jewel and hair ornament swap faces).
-**Right** — the same prompt through Unblend: you just write the text, the nodes
-do the masking, and each character stays herself.
-
-> The included workflow is **minimal on purpose** — it only shows the nodes
-> wired together (`example_workflows/unblend_workflow_example.json`). Bring your
-> own checkpoint, style and upscalers.
-
----
+A ready example graph ships in `example_workflows/unblend_workflow_example.json`.
+It is **minimal on purpose** — it only shows the nodes wired together. Bring your
+own checkpoint, style and upscalers.
 
 ## Requirements
 
-- SDXL / Illustrious checkpoint.
-- `dghs-imgutils` / `dghs-realutils` for the internal silhouette + head
-  detection used by the Dynamic Sampler (`pip install dghs-imgutils dghs-realutils`).
-- A SAM segmentation node for the hi-res instance masks feeding Assign Masks.
+If you install via **ComfyUI Manager**, the Python packages below are handled for
+you. For a manual install (or just for reference), Unblend needs:
+
+- An **SDXL / Illustrious** checkpoint.
+- **`dghs-imgutils` / `dghs-realutils`** — internal silhouette + head detection
+  used by the Dynamic Sampler. (In `requirements.txt`.)
+- A **SAM segmentation node** for the hi-res instance masks feeding Assign Masks.
   SAM is **not** part of ComfyUI core — install a pack via **ComfyUI Manager**
   (search "segment anything" / "SAM"); SAM2 (kijai) and SAM3 packs both work.
-- Pose Engine needs `rtmlib` (and onnxruntime) for `rtmlib_humanart`.
+- **`rtmlib`** (and `onnxruntime`) for `rtmlib_humanart` in the Pose Engine.
+  (In `requirements.txt`.)
 
-## Tests
+## Community
 
-Offline unit tests (no ComfyUI needed):
-
-```
-python tests/test_dynamic.py
-python tests/test_helpers.py
-python tests/test_patches.py
-python tests/test_scene.py
-```
-
----
+- **Question, idea, or want to show a result?** → open a thread in
+  [Discussions](https://github.com/LatentDesireAI/ComfyUI-Unblend/discussions).
+- **Found a bug?** → open an
+  [Issue](https://github.com/LatentDesireAI/ComfyUI-Unblend/issues).
+- **Got a fix?** → PRs welcome.
 
 ## Why I built this
 
@@ -125,32 +185,37 @@ couple of days sketching out the ideas I had and testing them. After that I
 finished the work with **Opus 4.8**. I'd love to see Fable 5 come back — I still
 have ideas for optimizing a few of the steps.
 
-In theory it goes up to 4 characters — just write `[CHAR1]` … `[CHAR2]` …
-`[CHAR3]` … `[CHAR4]`. For my own work I keep it to 2 for now.
-
 So here they are — a lazy person's shortcuts that might make your generations a
-little easier. If this helped, I'd be glad for any little bit via
+little easier. If they saved you time, I'd be glad for any little bit via
 [Ko-fi](https://ko-fi.com/latentdesire) 😋 — I burned a lot of time and tokens
 dialing in the result.
 
 Best regards, Alex
 
----
+## Support the art
 
-## Support
-
-This node is free and MIT-licensed. If it saved you time, the best way to give
-back is through the art it was built to make:
+Unblend is free and MIT-licensed. The best way to give back is through the art
+it was built to make:
 
 **🔗 [linktr.ee/latentdesire](https://linktr.ee/latentdesire)** — Patreon, Ko-fi
 and public galleries (Pixiv).
 
 > ⚠️ **18+ / NSFW.** The Patreon and galleries contain adult artwork and the
-> pages are age-gated. Not safe for work — 18+ only.
+> pages are age-gated. Not safe for work — 18+ only. The node itself is
+> general-purpose.
 
 ## Credits
 
 Built by **LatentDesireAI**, in collaboration with **Fable 5** and **Claude
 Opus 4.8** — from the attention-kernel research through to this release.
 
-Found a bug or have an idea? Open an issue or a PR.
+## Development
+
+Offline unit tests (no ComfyUI needed):
+
+```
+python tests/test_dynamic.py
+python tests/test_helpers.py
+python tests/test_patches.py
+python tests/test_scene.py
+```
