@@ -14,7 +14,7 @@ Most rules were derived from real bugs while building 2+ character scenes.
 |---|---|---|---|
 | `[QUALITY]` | embeddings, quality tags, quality/anatomy weights | `draw` (whole image) | `draw` + `base` |
 | `[STYLE]` | finish/look: skin, detailed, aesthetic, illustration | `draw` | `draw` + `base` |
-| `[SCENE]` | background, location, overall genre (`yuri`) | `draw` | `draw` + `base` |
+| `[SCENE]` | background, location, overall genre / mood | `draw` | `draw` + `base` |
 | `[CAMERA]` | light, angle, atmosphere (with weights) | `draw` | `draw` + `base` |
 | `[CHARn]` | **character identity**: name, hair, eyes, clothes, pose | **locked to the character's mask** (via a token span in `draw`) | encoded into `region_n` |
 | `[INTERACT]` | **interaction** (hugging, who is behind whom, touches) | `draw`, not locked to anyone | `draw` + `base` + all regions |
@@ -43,7 +43,7 @@ Most rules were derived from real bugs while building 2+ character scenes.
    (`girl` → `2girls`).
 
 3. **`[BODY]` doesn't work in Dynamic** — write body words (`petite`,
-   `small breasts`) briefly, directly into each `[CHARn]`.
+   `slender`) briefly, directly into each `[CHARn]`.
 
 4. **Keep `[CHARn]` compact (~35–45 tokens).**
    A long character breaks across the 77-token CLIP chunk boundary →
@@ -63,7 +63,7 @@ Most rules were derived from real bugs while building 2+ character scenes.
 
 ```
 [CHARn] <name \(series\)>, <signature: mask/wings/eyepatch>, <hair>, <eyes>,
-        <clothes + state>, <body: petite>, <emotion: blush, sweat, aroused>,
+        <clothes + state>, <body: petite>, <emotion: blush, smile, surprised>,
         <pose of this body>
 ```
 
@@ -76,11 +76,11 @@ Escape parentheses in names: `columbina \(genshin impact\)`.
 ```
 [QUALITY] masterpiece, best quality, <your quality embeddings>, ultra detailed, absurdres, cel shaded, (correct anatomy:1.2)
 [STYLE] glossy skin, detailed hair, intricate details, very aesthetic, premium anime illustration
-[SCENE] old wooden library, tall dark bookshelves, wooden table, yuri
+[SCENE] old wooden library, tall dark bookshelves, wooden table, warm afternoon
 [CAMERA] soft warm lighting, dust particles, (cinematic lighting:1.25), (volumetric lighting:1.3), (chiaroscuro:1.25), (dramatic shadows:1.2)
-[CHAR1] columbina \(genshin impact\), (white x-shaped lace mask:1.2), closed eyes, black pink two-tone hair, head wings, white dress pulled up, exposed breasts, petite, blush, aroused, lying on side, pleasure expression
-[CHAR2] fischl \(genshin impact\), blonde hair, purple eyes, eyepatch, black gothic lolita dress pulled up, exposed breasts, thighhighs, petite, blush, aroused, pleasure expression
-[INTERACT] yuri spooning, fischl lying behind columbina, hand on her breast, intimate
+[CHAR1] columbina \(genshin impact\), (white x-shaped lace mask:1.2), closed eyes, black pink two-tone hair, head wings, white dress, (white thighhighs:1.15), petite, gentle smile, standing
+[CHAR2] fischl \(genshin impact\), blonde hair, purple eyes, eyepatch, black gothic lolita dress, black thighhighs, petite, confident smile, hand raised
+[INTERACT] standing side by side, looking at each other, same height
 ```
 
 ### Mapping a flat prompt onto tags
@@ -93,8 +93,8 @@ The reference "flat" prompt decomposes like this:
 | `glossy skin, very aesthetic, premium anime illustration` | `[STYLE]` |
 | `1girl, <name>, hair, eyes, hat` | `[CHARn]` (name + signature) |
 | `mature face, refined features` | `[CHARn]` (face) |
-| clothes, `no panties` | `[CHARn]` (clothes) |
-| `petite, small breasts, slender thighs` | `[CHARn]` briefly (Dynamic) / `[BODY]` (Bounded) |
+| `white dress, white thighhighs` | `[CHARn]` (clothes) |
+| `petite, slender build` | `[CHARn]` briefly (Dynamic) / `[BODY]` (Bounded) |
 | `old library, bookshelves` | `[SCENE]` |
 | `cinematic lighting, chiaroscuro` | `[CAMERA]` |
 
@@ -125,16 +125,16 @@ glossy skin, detailed hair, intricate details, very aesthetic, premium anime ill
 - This is a "finishing tail", NOT `anime style, thick outlines, vivid colors`.
 - If the style drifted — the cause is almost always here.
 
-### `[SCENE]` — background/setting/genre
+### `[SCENE]` — background/setting/mood
 ```
-old wooden library, tall dark bookshelves, wooden table, yuri
+old wooden library, tall dark bookshelves, wooden table, warm afternoon
 ```
-- Location + overall genre (`yuri`). For manga you fix it, changing only the action.
+- Location + overall mood. For manga you fix it, changing only the action.
 
 ### `[CHAR1]` / `[CHAR2]` — identities (the main thing)
 ```
-[CHAR1] columbina \(genshin impact\), (white x-shaped lace mask), closed eyes, black pink two-tone hair, head wings, white dress pulled up, exposed breasts, (white thighhighs:1.15), petite, blush, aroused, sitting, pleasure expression
-[CHAR2] fischl \(genshin impact\), blonde hair, clear purple eyes, black gothic lolita dress pulled up, exposed breasts, black thighhighs, petite, blush, aroused, pleasure expression
+[CHAR1] columbina \(genshin impact\), (white x-shaped lace mask), closed eyes, black pink two-tone hair, head wings, white dress, (white thighhighs:1.15), petite, gentle smile, sitting
+[CHAR2] fischl \(genshin impact\), blonde hair, clear purple eyes, black gothic lolita dress, black thighhighs, petite, confident smile, looking at viewer
 ```
 1. **Canonical tag with escaping** `\(...\)` — the strongest face signal. Don't dilute it with synonyms.
 2. **Order:** name → signature → hair/eyes → clothes+state → body → emotion → pose.
@@ -165,7 +165,7 @@ eye level, straight-on view, level horizon, soft warm lighting, (cinematic light
 
 ### `[INTERACT]` — interaction and relative things
 ```
-fischl pulls columbina closer, surprised, arms around each other, same height, intimate
+fischl pulls columbina closer, surprised, arms around each other, same height
 ```
 - Here: who does what to whom, relations, names **in the context of the action**.
 - `same height` fixes height asymmetry (**size is solved by composition, not by refine**).
@@ -184,10 +184,10 @@ fischl pulls columbina closer, surprised, arms around each other, same height, i
 
 ---
 
-## 5. Node parameters for overlap (spooning / hugging)
+## 5. Node parameters for overlap (hugging / close pairs)
 
 - `init_ratios = "1,1"` — starting left/right columns. For "side by side" — ok;
-  for heavy overlap (spooning) try `""` (off) — the zones are taken from the
+  for heavy overlap (a close hug) try `""` (off) — the zones are taken from the
   attn maps.
 - `divider = watershed` (for hugging/overlap, **not** `nearest_center`).
 - `warmup_at ≈ 0.15–0.25`.
@@ -257,7 +257,7 @@ char_points = 0.3,0.45; 0.7,0.45
 
 **Example (our prompt — sitting together, eye level, columbina left / fischl right):**
 ```
-[INTERACT] fischl pulls columbina closer, side by side, same height, intimate
+[INTERACT] fischl pulls columbina closer, side by side, same height
 char_points = 0.32,0.42; 0.68,0.42
 ```
 CHAR1 = columbina on the left (`x=0.32`), CHAR2 = fischl on the right (`x=0.68`); same
@@ -290,7 +290,7 @@ Output rules:
 - each scene's `char_points` — by the recipe above (for its composition).
 - `horizontal` — recommended format: `true` = horizontal (landscape),
   `false` = vertical (portrait). Rule: lying / wide pair / top view
-  → `true`; standing / sitting close / intimate close-up → `false`.
+  → `true`; standing / sitting close / close-up → `false`.
 - `name` — a human-readable label (location/action).
 - Ready template: `example_workflows/scenes_columbina_fischl.json`.
 
@@ -318,7 +318,7 @@ How to fix:
   early and clearly (ours: `black pink two-tone hair, closed eyes` vs
   `blonde hair, purple eyes, eyepatch`).
 - **Remove shared tokens** where you can: the same tail
-  `blush, sweat, aroused, pleasure expression` in both reinforces "cloning".
+  `blush, smile, looking at viewer` in both reinforces "cloning".
   Keep the shared part minimal, move the relation into `[INTERACT]`.
 - **`self_attn_jail = True`, `jail_strength = 1.0`** — cuts self-attn
   "peeking" between characters.

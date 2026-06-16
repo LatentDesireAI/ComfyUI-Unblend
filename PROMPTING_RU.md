@@ -14,7 +14,7 @@
 |---|---|---|---|
 | `[QUALITY]` | эмбеддинги, quality-теги, веса качества/анатомии | `draw` (вся картинка) | `draw` + `base` |
 | `[STYLE]` | финиш/подача: skin, detailed, aesthetic, illustration | `draw` | `draw` + `base` |
-| `[SCENE]` | фон, локация, общий жанр (`yuri`) | `draw` | `draw` + `base` |
+| `[SCENE]` | фон, локация, общий жанр / настроение | `draw` | `draw` + `base` |
 | `[CAMERA]` | свет, ракурс, атмосфера (с весами) | `draw` | `draw` + `base` |
 | `[CHARn]` | **личность персонажа**: имя, волосы, глаза, одежда, поза | **запирается на маску персонажа** (через токен-спан в `draw`) | энкодится в `region_n` |
 | `[INTERACT]` | **взаимодействие** (объятия, кто за кем, касания) | `draw`, ни на кого не запирается | `draw` + `base` + все регионы |
@@ -37,7 +37,7 @@
    добавляется автоматически из `subject_word` + кол-ва персонажей).
 
 3. **`[BODY]` не работает в Dynamic** — телесные слова (`petite`,
-   `small breasts`) вписывай коротко прямо в каждый `[CHARn]`.
+   `slender`) вписывай коротко прямо в каждый `[CHARn]`.
 
 4. **Держи `[CHARn]` компактным (~35–45 токенов).**
    Длинный персонаж рвётся через границу 77-токенного чанка CLIP →
@@ -57,7 +57,7 @@
 
 ```
 [CHARn] <имя \(серия\)>, <сигнатура: маска/крылья/повязка>, <волосы>, <глаза>,
-        <одежда + состояние>, <тело: petite>, <эмоция: blush, sweat, aroused>,
+        <одежда + состояние>, <тело: petite>, <эмоция: blush, smile, surprised>,
         <поза этого тела>
 ```
 
@@ -70,11 +70,11 @@
 ```
 [QUALITY] masterpiece, best quality, <your quality embeddings>, ultra detailed, absurdres, cel shaded, (correct anatomy:1.2)
 [STYLE] glossy skin, detailed hair, intricate details, very aesthetic, premium anime illustration
-[SCENE] old wooden library, tall dark bookshelves, wooden table, yuri
+[SCENE] old wooden library, tall dark bookshelves, wooden table, warm afternoon
 [CAMERA] soft warm lighting, dust particles, (cinematic lighting:1.25), (volumetric lighting:1.3), (chiaroscuro:1.25), (dramatic shadows:1.2)
-[CHAR1] columbina \(genshin impact\), (white x-shaped lace mask:1.2), closed eyes, black pink two-tone hair, head wings, white dress pulled up, exposed breasts, petite, blush, aroused, lying on side, pleasure expression
-[CHAR2] fischl \(genshin impact\), blonde hair, purple eyes, eyepatch, black gothic lolita dress pulled up, exposed breasts, thighhighs, petite, blush, aroused, pleasure expression
-[INTERACT] yuri spooning, fischl lying behind columbina, hand on her breast, intimate
+[CHAR1] columbina \(genshin impact\), (white x-shaped lace mask:1.2), closed eyes, black pink two-tone hair, head wings, white dress, (white thighhighs:1.15), petite, gentle smile, standing
+[CHAR2] fischl \(genshin impact\), blonde hair, purple eyes, eyepatch, black gothic lolita dress, black thighhighs, petite, confident smile, hand raised
+[INTERACT] standing side by side, looking at each other, same height
 ```
 
 ### Перенос плоского промпта в теги
@@ -87,8 +87,8 @@
 | `glossy skin, very aesthetic, premium anime illustration` | `[STYLE]` |
 | `1girl, <имя>, волосы, глаза, шляпа` | `[CHARn]` (имя + сигнатура) |
 | `mature face, refined features` | `[CHARn]` (лицо) |
-| одежда, `no panties` | `[CHARn]` (одежда) |
-| `petite, small breasts, slender thighs` | `[CHARn]` коротко (Dynamic) / `[BODY]` (Bounded) |
+| `white dress, white thighhighs` | `[CHARn]` (одежда) |
+| `petite, slender build` | `[CHARn]` коротко (Dynamic) / `[BODY]` (Bounded) |
 | `old library, bookshelves` | `[SCENE]` |
 | `cinematic lighting, chiaroscuro` | `[CAMERA]` |
 
@@ -119,16 +119,16 @@ glossy skin, detailed hair, intricate details, very aesthetic, premium anime ill
 - Это «финишный хвост», а НЕ `anime style, thick outlines, vivid colors`.
 - Если стиль уехал — причина почти всегда здесь.
 
-### `[SCENE]` — фон/сеттинг/жанр
+### `[SCENE]` — фон/сеттинг/настроение
 ```
-old wooden library, tall dark bookshelves, wooden table, yuri
+old wooden library, tall dark bookshelves, wooden table, warm afternoon
 ```
-- Локация + общий жанр (`yuri`). Для манги фиксируешь, меняя только действие.
+- Локация + общее настроение. Для манги фиксируешь, меняя только действие.
 
 ### `[CHAR1]` / `[CHAR2]` — личности (главное)
 ```
-[CHAR1] columbina \(genshin impact\), (white x-shaped lace mask), closed eyes, black pink two-tone hair, head wings, white dress pulled up, exposed breasts, (white thighhighs:1.15), petite, blush, aroused, sitting, pleasure expression
-[CHAR2] fischl \(genshin impact\), blonde hair, clear purple eyes, black gothic lolita dress pulled up, exposed breasts, black thighhighs, petite, blush, aroused, pleasure expression
+[CHAR1] columbina \(genshin impact\), (white x-shaped lace mask), closed eyes, black pink two-tone hair, head wings, white dress, (white thighhighs:1.15), petite, gentle smile, sitting
+[CHAR2] fischl \(genshin impact\), blonde hair, clear purple eyes, black gothic lolita dress, black thighhighs, petite, confident smile, looking at viewer
 ```
 1. **Канон-тег с экранированием** `\(...\)` — сильнейший сигнал лица. Не разбавлять синонимами.
 2. **Порядок:** имя → сигнатура → волосы/глаза → одежда+состояние → тело → эмоция → поза.
@@ -159,12 +159,11 @@ eye level, straight-on view, level horizon, soft warm lighting, (cinematic light
 
 ### `[INTERACT]` — взаимодействие и относительные вещи
 ```
-fischl pulls columbina closer, surprised, arms around each other, same height, intimate
+fischl pulls columbina closer, surprised, arms around each other, same height
 ```
 - Сюда: кто что делает с кем, реляции, имена **в контексте действия**.
 - `same height` лечит асимметрию роста (**размер решается композицией, не рефайном**).
-- Поза/действие тут, но **СМЕНА действия требует ControlNet**, не только текста
-  (см. [MANGA_PLAN.md](MANGA_PLAN.md)).
+- Поза/действие тут, но **СМЕНА действия требует ControlNet**, не только текста.
 
 ### Чек-лист перед генерацией
 - [ ] канон-теги обоих, экранированы `\(...\)`
@@ -179,10 +178,10 @@ fischl pulls columbina closer, surprised, arms around each other, same height, i
 
 ---
 
-## 5. Параметры ноды под нахлёст (spooning / объятия)
+## 5. Параметры ноды под нахлёст (объятия / близкие пары)
 
 - `init_ratios = "1,1"` — стартовые колонки слева/справа. Для «бок о бок» — ок;
-  для сильного нахлёста (spooning) попробуй `""` (выкл) — зоны возьмутся из
+  для сильного нахлёста (близкие объятия) попробуй `""` (выкл) — зоны возьмутся из
   attn-карт.
 - `divider = watershed` (для объятий/нахлёста, **не** `nearest_center`).
 - `warmup_at ≈ 0.15–0.25`.
@@ -252,7 +251,7 @@ char_points = 0.3,0.45; 0.7,0.45
 
 **Пример (наш промпт — сидят рядом, eye level, columbina слева / fischl справа):**
 ```
-[INTERACT] fischl pulls columbina closer, side by side, same height, intimate
+[INTERACT] fischl pulls columbina closer, side by side, same height
 char_points = 0.32,0.42; 0.68,0.42
 ```
 CHAR1 = columbina слева (`x=0.32`), CHAR2 = fischl справа (`x=0.68`); одинаковый
@@ -285,7 +284,7 @@ CHAR1 = columbina слева (`x=0.32`), CHAR2 = fischl справа (`x=0.68`);
 - `char_points` каждой сцены — по рецепту выше (под её композицию).
 - `horizontal` — рекомендуемый формат: `true` = горизонтальный (landscape),
   `false` = вертикальный (portrait). Правило: лежат / широкая пара / вид сверху
-  → `true`; стоят / сидят близко / интимный крупный план → `false`.
+  → `true`; стоят / сидят близко / крупный план → `false`.
 - `name` — человекочитаемая метка (локация/действие).
 - Готовый шаблон: `example_workflows/scenes_columbina_fischl.json`.
 
@@ -313,7 +312,7 @@ CHAR1 = columbina слева (`x=0.32`), CHAR2 = fischl справа (`x=0.68`);
   рано и чётко (у нас: `black pink two-tone hair, closed eyes` vs
   `blonde hair, purple eyes, eyepatch`).
 - **Убрать общие токены** там, где можно: одинаковый хвост
-  `blush, sweat, aroused, pleasure expression` в обоих усиливает «клонирование».
+  `blush, smile, looking at viewer` в обоих усиливает «клонирование».
   Оставь общее минимальным, реляцию увели в `[INTERACT]`.
 - **`self_attn_jail = True`, `jail_strength = 1.0`** — режет «подглядывание»
   self-attn между персонажами.
