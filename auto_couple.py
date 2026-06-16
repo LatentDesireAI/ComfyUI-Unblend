@@ -2314,6 +2314,12 @@ class UnblendSequentialRefine:
                 "detail_size": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64}),
                 # запас контекста вокруг bbox маски (1.0 = впритык). 1.3-1.6.
                 "crop_factor": ("FLOAT", {"default": 1.4, "min": 1.0, "max": 3.0, "step": 0.1}),
+                # фон по кусочкам: проход по фону режется на плитки ~bg_tile_size
+                # и каждая досэмплируется отдельно (нативное SDXL-разрешение ->
+                # детали по всему холсту). Off = один масочный проход на весь
+                # кадр. Персонажи держатся маской -> не дублируются на декоре.
+                "bg_tiled": ("BOOLEAN", {"default": False}),
+                "bg_tile_size": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64}),
             },
         }
 
@@ -2389,11 +2395,78 @@ class UnblendSequentialRefine:
         out[:, y0:y1, x0:x1, :] = det * alpha + crop * (1 - alpha)
         return out, f"crop {nw}x{nh} -> {tw}x{th} @ denoise {denoise}"
 
+    @staticmethod
+    def _tiled_bg_refine(model, cur, bg, pos_bg, neg_cond, seed, steps, cfg,
+                         sampler_name, scheduler, denoise, tile_size):
+        """Фон по кусочкам: латент режется на перекрывающиеся плитки ~tile_size
+        пикселей, каждая досэмплируется scene-промптом ТОЛЬКО в зоне фона
+        (персонажи держатся noise_mask -> не дублируются на декоре). Плитки
+        сшиваются перекрытием с пером + финальная вклейка по маске фона.
+        Возвращает (латент, число обработанных плиток).
+
+        Работаем в латенте (без VAE на плитку): срез латента 128x128 = регион
+        1024px, т.е. SDXL досэмплит каждый кусок на родном разрешении."""
+        import comfy.sample
+        import comfy.utils
+
+        _, _, h_lat, w_lat = cur.shape
+        tl_h = min(max(8, int(tile_size) // 8), h_lat)
+        tl_w = min(max(8, int(tile_size) // 8), w_lat)
+        ov_h, ov_w = max(1, tl_h // 4), max(1, tl_w // 4)
+
+        def starts(total, tile, step):
+            if tile >= total:
+                return [0]
+            pos = list(range(0, total - tile + 1, max(1, step)))
+            if pos[-1] != total - tile:
+                pos.append(total - tile)
+            return pos
+
+        def ramp(L, R):
+            w = torch.ones(L)
+            R = min(R, L // 2)
+            if R >= 1:
+                r = torch.linspace(1.0 / (R + 1), 1.0, R)
+                w[:R] = r
+                w[L - R:] = r.flip(0)
+            return w
+
+        win = (ramp(tl_h, ov_h).view(-1, 1) * ramp(tl_w, ov_w).view(1, -1))
+        win = win.to(cur.device, cur.dtype)               # (tl_h, tl_w)
+
+        acc = torch.zeros_like(cur)
+        wsum = torch.zeros(1, 1, h_lat, w_lat, dtype=cur.dtype, device=cur.device)
+        ntiles = 0
+        for y0 in starts(h_lat, tl_h, tl_h - ov_h):
+            for x0 in starts(w_lat, tl_w, tl_w - ov_w):
+                y1, x1 = y0 + tl_h, x0 + tl_w
+                bg_t = bg[y0:y1, x0:x1]
+                if float(bg_t.max()) < 0.02:
+                    continue                              # плитка целиком на герое
+                lat_t = cur[:, :, y0:y1, x0:x1].contiguous()
+                noise = comfy.sample.prepare_noise(lat_t, seed + ntiles, None)
+                out_t = comfy.sample.sample(
+                    model, noise, steps, cfg, sampler_name, scheduler,
+                    pos_bg, neg_cond, lat_t,
+                    denoise=denoise, disable_noise=False,
+                    start_step=None, last_step=None, force_full_denoise=False,
+                    noise_mask=bg_t.reshape(1, 1, tl_h, tl_w), callback=None,
+                    disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+                    seed=seed + ntiles)
+                out_t = out_t.to(cur.device, cur.dtype)
+                acc[:, :, y0:y1, x0:x1] += out_t * win
+                wsum[:, :, y0:y1, x0:x1] += win
+                ntiles += 1
+
+        tiled = torch.where(wsum > 1e-6, acc / wsum.clamp(min=1e-6), cur)
+        a = bg.clamp(0, 1).reshape(1, 1, h_lat, w_lat).to(cur.device, cur.dtype)
+        return tiled * a + cur * (1 - a), ntiles
+
     def run(self, model, clip, vae, image, char_masks, prompt, negative_prompt,
             seed, steps, cfg, sampler_name, scheduler, refine_denoise=0.45,
             background_denoise=0.3, harmonize_denoise=0.18, mask_feather=4,
             subject_word="girl", per_char_upscale=False, detail_size=1024,
-            crop_factor=1.4):
+            crop_factor=1.4, bg_tiled=False, bg_tile_size=1024):
         import comfy.sample
         import comfy.utils
 
@@ -2501,17 +2574,25 @@ class UnblendSequentialRefine:
             bg = feather_masks(bg.unsqueeze(0), mask_feather)[0]
             if float(bg.max()) >= 0.02:
                 pos_bg = UnblendBoundedSampler._encode(clip, scene_prompt(sections))
-                bg_lat = bg.view(1, 1, h_lat, w_lat)
-                noise = comfy.sample.prepare_noise(cur, seed + 777, None)
-                cur = comfy.sample.sample(
-                    model, noise, steps, cfg, sampler_name, scheduler,
-                    pos_bg, neg_cond, cur,
-                    denoise=background_denoise, disable_noise=False,
-                    start_step=None, last_step=None, force_full_denoise=False,
-                    noise_mask=bg_lat, callback=None,
-                    disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
-                    seed=seed + 777)
-                info.append(f"фон @ denoise {background_denoise}")
+                if bg_tiled:
+                    cur, ntiles = self._tiled_bg_refine(
+                        model, cur, bg, pos_bg, neg_cond, seed + 777, steps,
+                        cfg, sampler_name, scheduler, background_denoise,
+                        bg_tile_size)
+                    info.append(f"фон по кусочкам: {ntiles} плиток @ denoise "
+                                f"{background_denoise}")
+                else:
+                    bg_lat = bg.view(1, 1, h_lat, w_lat)
+                    noise = comfy.sample.prepare_noise(cur, seed + 777, None)
+                    cur = comfy.sample.sample(
+                        model, noise, steps, cfg, sampler_name, scheduler,
+                        pos_bg, neg_cond, cur,
+                        denoise=background_denoise, disable_noise=False,
+                        start_step=None, last_step=None, force_full_denoise=False,
+                        noise_mask=bg_lat, callback=None,
+                        disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
+                        seed=seed + 777)
+                    info.append(f"фон @ denoise {background_denoise}")
 
         # ── финальный хармонайз без маски: сшить швы/свет ───────────────────
         if harmonize_denoise > 0:
