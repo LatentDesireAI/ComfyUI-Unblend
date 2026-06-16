@@ -44,7 +44,47 @@ Scene Book (JSON) ─┬─► full_prompt ──► Dynamic Sampler ──► d
   details the background separately — no feature leak, no duplicates on decor.
 - **Scene Book** + **Line Counter** drive a whole prompt collection by index.
 
-A ready example graph: `example_workflows/unblend_dynamic_test.json`.
+A ready example graph: `example_workflows/unblend_workflow_example.json`.
+
+---
+
+## Demo
+
+A hard case on purpose: **Ningguang × Shenhe** (Genshin Impact) — two
+white-haired characters, so a plain sampler blends their faces and swaps their
+accessories. That makes the difference easy to see.
+
+### 1. Unblend Dynamic Sampler (Bounded Attention)
+
+![Dynamic Sampler — composition pass](example_workflows/img_demo/01_dynamic_sampler.png)
+
+The composition pass. One prompt with `[CHAR1]` / `[CHAR2]`, one trajectory —
+the node rebuilds each character's mask from the model's own cross-attention
+maps and keeps her tokens inside it. The two are already separated here, with
+**no hand-drawn masks**.
+
+### 2. Unblend Sequential Refine (per-char img2img)
+
+![Sequential Refine — hi-res detail](example_workflows/img_demo/02_sequential_refine.png)
+
+The detail / hi-res pass that replaces a second KSampler. Each character is
+redrawn with **only her own `[CHARn]`** (zero neighbour tokens → no feature
+leak), and the background is detailed separately. Crisp faces, clean accessories.
+
+### Before / after
+
+| Standard generation (no masks) | With Unblend |
+|---|---|
+| ![Standard generation](example_workflows/img_demo/03_standard_generation.png) | ![Using Unblend](example_workflows/img_demo/04_using_unblend.png) |
+
+**Left** — a normal prompt on a plain sampler: Ningguang and Shenhe bleed into
+each other (hair mixes, the forehead jewel and hair ornament swap faces).
+**Right** — the same prompt through Unblend: you just write the text, the nodes
+do the masking, and each character stays herself.
+
+> The included workflow is **minimal on purpose** — it only shows the nodes
+> wired together (`example_workflows/unblend_workflow_example.json`). Bring your
+> own checkpoint, style and upscalers.
 
 ---
 
@@ -53,8 +93,9 @@ A ready example graph: `example_workflows/unblend_dynamic_test.json`.
 - SDXL / Illustrious checkpoint.
 - `dghs-imgutils` / `dghs-realutils` for the internal silhouette + head
   detection used by the Dynamic Sampler (`pip install dghs-imgutils dghs-realutils`).
-- A SAM node (e.g. SAM2 / SAM3 from another pack) for hi-res instance masks
-  feeding Assign Masks.
+- A SAM segmentation node for the hi-res instance masks feeding Assign Masks.
+  SAM is **not** part of ComfyUI core — install a pack via **ComfyUI Manager**
+  (search "segment anything" / "SAM"); SAM2 (kijai) and SAM3 packs both work.
 - Pose Engine needs `rtmlib` (and onnxruntime) for `rtmlib_humanart`.
 
 ## Tests
@@ -67,6 +108,31 @@ python tests/test_helpers.py
 python tests/test_patches.py
 python tests/test_scene.py
 ```
+
+---
+
+## Why I built this
+
+Hi! I got into AI art generation, and over time I kept hitting the same thing:
+characters tend to bleed details into each other. It bugged me, so I went
+digging into the what / how / why. Most fixes use regional prompting and a pile
+of masks — all by hand, which eats a ton of time. (There were automatic options
+too, but they were complex and fiddly, and didn't always hold up, especially on
+busy scenes.)
+
+When Anthropic released **Fable 5**, I caught a short window with it and spent a
+couple of days sketching out the ideas I had and testing them. After that I
+finished the work with **Opus 4.8**. I'd love to see Fable 5 come back — I still
+have ideas for optimizing a few of the steps.
+
+In theory it goes up to 4 characters — just write `[CHAR1]` … `[CHAR2]` …
+`[CHAR3]` … `[CHAR4]`. For my own work I keep it to 2 for now.
+
+So here they are — a lazy person's shortcuts that might make your generations a
+little easier. If this helped, I'd be glad for any little bit via Ko-fi 😋 — I
+burned a lot of time and tokens dialing in the result.
+
+Best regards, Alex
 
 ---
 
