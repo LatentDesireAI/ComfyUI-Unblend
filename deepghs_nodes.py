@@ -1,21 +1,21 @@
 """
 ComfyUI-Unblend :: detect + segment (deepghs)
 ==============================================
-DeepghsCharSeg — комбинирует:
-  1) anime person DETECT (realutils.detect_persons) — разделяет персонажей
-     даже на слипшихся/обнимающихся телах (даёт N боксов)
-  2) anime foreground SEGMENT (imgutils segment_rgba_with_isnetis) — чистый
-     силуэт переднего плана (персонажи vs фон), но без разделения между ними
+DeepghsCharSeg — combines:
+  1) anime person DETECT (realutils.detect_persons) — separates characters
+     even on stuck-together / hugging bodies (gives N boxes)
+  2) anime foreground SEGMENT (imgutils segment_rgba_with_isnetis) — a clean
+     foreground silhouette (characters vs background), but no split between them
 
-Пересечение: маска персонажа N = (глобальный силуэт) ∩ (бокс N),
-а спорные пиксели в зоне перекрытия боксов отдаём ближайшему по центру.
+Intersection: character N's mask = (global silhouette) ∩ (box N),
+and contested pixels in the box-overlap zone go to the nearest center.
 
-Это решает кейс, где обычный person_yolov8m-seg видел двух обнимающихся
-девушек как ОДИН instance (count=1 на весь кадр).
+This solves the case where a plain person_yolov8m-seg saw two hugging
+girls as ONE instance (count=1 for the whole frame).
 
-Зависимости (ставить в окружение ComfyUI):
+Dependencies (install into the ComfyUI environment):
   pip install dghs-realutils dghs-imgutils
-Модели качаются автоматически при первом запуске (ONNX, с HF).
+Models download automatically on first run (ONNX, from HF).
 """
 
 import math
@@ -24,8 +24,8 @@ import numpy as np
 import torch
 
 
-# Стандартный OpenPose body-18: связи костей и канонические цвета.
-# Порядок индексов OP18 совпадает с COCO-18 (см. imgutils OpenPose18).
+# Standard OpenPose body-18: bone links and canonical colors.
+# OP18 index order matches COCO-18 (see imgutils OpenPose18).
 _OP18_LIMBS = [[1, 2], [1, 5], [2, 3], [3, 4], [5, 6], [6, 7], [1, 8],
                [8, 9], [9, 10], [1, 11], [11, 12], [12, 13], [1, 0],
                [0, 14], [14, 16], [0, 15], [15, 17]]
@@ -37,10 +37,10 @@ _OP18_COLORS = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0],
 
 
 def render_openpose(h, w, bodies, point_conf=0.3):
-    """Нарисовать стандартный OpenPose-скелет (под ControlNet) на чёрном холсте.
+    """Draw a standard OpenPose skeleton (for ControlNet) on a black canvas.
 
-    bodies — список массивов (18,3) [x,y,score] на персонажа. Точки/кости
-    со score<=point_conf пропускаются. -> np.uint8 RGB (h,w,3).
+    bodies — list of (18,3) [x,y,score] arrays per character. Points/bones
+    with score<=point_conf are skipped. -> np.uint8 RGB (h,w,3).
     """
     import cv2
     canvas = np.zeros((h, w, 3), dtype=np.uint8)
@@ -84,11 +84,11 @@ def _center(b):
 
 
 def _dedup_boxes(boxes, confs, min_dist):
-    """Убрать дубли-боксы, чьи центры ближе min_dist (оставляем более уверенный).
+    """Drop duplicate boxes whose centers are closer than min_dist (keep the more confident one).
 
-    Защита от лишнего счётчика, когда детектор лепит два бокса на одну голову.
+    Guards the count from inflating when the detector puts two boxes on one head.
     """
-    order = sorted(range(len(boxes)), key=lambda i: -confs[i])  # сначала уверенные
+    order = sorted(range(len(boxes)), key=lambda i: -confs[i])  # confident ones first
     kept = []
     for i in order:
         cx, cy = _center(boxes[i])
@@ -100,12 +100,12 @@ def _dedup_boxes(boxes, confs, min_dist):
                 break
         if not dup:
             kept.append(i)
-    kept.sort()  # вернуть исходный порядок
+    kept.sort()  # restore the original order
     return [boxes[i] for i in kept], [confs[i] for i in kept]
 
 
 def _match_head_to_person(head_box, person_boxes):
-    """Вернуть бокс тела, внутри которого центр головы; иначе ближайший по центру."""
+    """Return the body box that contains the head center; else the nearest by center."""
     hcx, hcy = _center(head_box)
     for pb in person_boxes:
         if pb[0] <= hcx <= pb[2] and pb[1] <= hcy <= pb[3]:
@@ -126,7 +126,7 @@ def _parse_dets(dets):
 
 
 def _call_det(fn, *args, max_infer_size=None, **kw):
-    """Вызвать detect-функцию с max_infer_size; откат без него, если не поддерживается."""
+    """Call a detect function with max_infer_size; fall back without it if unsupported."""
     if max_infer_size:
         try:
             return fn(*args, max_infer_size=max_infer_size, **kw)
@@ -136,19 +136,19 @@ def _call_det(fn, *args, max_infer_size=None, **kw):
 
 
 def _imgutils_model_for_pose(model_name):
-    """Для pose нужен imgutils-детектор. yv11/невалидное -> дефолт imgutils."""
+    """Pose needs an imgutils detector. yv11/invalid -> default imgutils."""
     if model_name.endswith("_yv11"):
         return "person_detect_v1.1_m"
     return model_name
 
 
 def detect_person_backend(pil, model_name, conf, iou, max_infer):
-    """Детект тел по ИМЕНИ модели. -> (boxes, confs).
+    """Detect bodies by model NAME. -> (boxes, confs).
 
-    Роутинг по суффиксу:
-      *_yv11  -> realutils.detect_persons (старые yv11-модели)
-      иначе   -> imgutils.detect_person (AniDet3, model_name напрямую)
-    Имена должны существовать в репо deepghs/anime_person_detection.
+    Routing by suffix:
+      *_yv11  -> realutils.detect_persons (old yv11 models)
+      else    -> imgutils.detect_person (AniDet3, model_name directly)
+    Names must exist in the deepghs/anime_person_detection repo.
     """
     if model_name.endswith("_yv11"):
         from realutils.detect import detect_persons
@@ -164,7 +164,7 @@ def detect_person_backend(pil, model_name, conf, iou, max_infer):
 
 
 def detect_heads_backend(pil, conf, iou, max_infer):
-    """Детект голов (imgutils). -> (boxes, confs)."""
+    """Detect heads (imgutils). -> (boxes, confs)."""
     from imgutils.detect import detect_heads
     dets = _call_det(detect_heads, pil, conf_threshold=conf,
                      iou_threshold=iou, max_infer_size=max_infer)
@@ -172,7 +172,7 @@ def detect_heads_backend(pil, conf, iou, max_infer):
 
 
 def silhouette_fg(pil):
-    """Силуэт переднего плана (isnetis) -> бинарная маска (h,w) uint8 (1=персонаж)."""
+    """Foreground silhouette (isnetis) -> binary mask (h,w) uint8 (1=character)."""
     import cv2
     from imgutils.segment import segment_rgba_with_isnetis
     w, h = pil.size
@@ -188,10 +188,10 @@ def silhouette_fg(pil):
 
 
 def person_boxes_from_heads_fg(fg, head_boxes, w, h):
-    """Боксы тел для DWPose из СИЛУЭТА + голов (надёжнее внутреннего detect_person).
+    """Body boxes for DWPose from the SILHOUETTE + heads (more reliable than the internal detect_person).
 
-    Пиксели силуэта раздаются ближайшей голове (Вороной), бокс каждого =
-    габариты его части силуэта. Соло (0-1 голова) -> один бокс = bbox силуэта.
+    Silhouette pixels are handed to the nearest head (Voronoi), each box =
+    the extent of its silhouette part. Solo (0-1 head) -> one box = silhouette bbox.
     """
     ys_all, xs_all = np.where(fg > 0)
     if xs_all.size == 0:
@@ -214,16 +214,16 @@ def person_boxes_from_heads_fg(fg, head_boxes, w, h):
 
 
 def pose_persons(pil, person_cfgs=None, out_bboxes=None, point_conf=0.3):
-    """DWPose: скелет на каждого персонажа. -> список dict:
-       {box, seed (центр тела), points (точки скелета для watershed-сидов), conf}.
+    """DWPose: a skeleton per character. -> list of dicts:
+       {box, seed (body center), points (skeleton points for watershed seeds), conf}.
 
-    points/seed берём из 18 точек тела (.body) с score>point_conf — они
-    разбросаны по всему телу (плечи/бёдра/колени), поэтому зоны делятся
-    по реальному телу, а не от одной точки. Лучший вариант для лежачих поз.
+    points/seed come from the 18 body points (.body) with score>point_conf — they
+    are spread over the whole body (shoulders/hips/knees), so zones split by the
+    real body, not from a single point. Best option for lying-down poses.
     """
     from imgutils.pose import dwpose_estimate
     if out_bboxes is not None:
-        # явные боксы (от силуэта+голов) -> dwpose не зовёт свой detect_person
+        # explicit boxes (from silhouette+heads) -> dwpose skips its own detect_person
         kps = dwpose_estimate(pil, auto_detect=False, out_bboxes=out_bboxes)
     else:
         kps = dwpose_estimate(pil, person_detect_cfgs=person_cfgs)
@@ -240,24 +240,24 @@ def pose_persons(pil, person_cfgs=None, out_bboxes=None, point_conf=0.3):
         seed = (float(np.mean(xs)), float(np.mean(ys)))
         conf = float(np.mean(valid[:, 2]))
         out.append({"box": box, "seed": seed, "points": pts, "conf": conf,
-                    "body18": body})  # полный скелет (18,3) для рендера OpenPose
+                    "body18": body})  # full skeleton (18,3) for the OpenPose render
     return out
 
 
 class DeepghsCharSeg:
     """
-    Детект персонажей (deepghs) + сегментация силуэта (isnetis) = точные маски.
+    Character detect (deepghs) + silhouette segmentation (isnetis) = precise masks.
 
-    Выходы:
-      combined_mask  : MASK   — все персонажи (силуэт переднего плана)
-      instance_masks : MASK   — батч (N,H,W), точная маска каждого персонажа
-      preview        : IMAGE  — арт с боксами + полупрозрачными масками
+    Outputs:
+      combined_mask  : MASK   — all characters (foreground silhouette)
+      instance_masks : MASK   — batch (N,H,W), a precise mask per character
+      preview        : IMAGE  — art with boxes + semi-transparent masks
       count          : INT
       bboxes_json    : STRING
     """
 
-    # Реально существующие имена в репо deepghs/anime_person_detection
-    # (+ старые yv11 через realutils). Суффикс _yv11 = realutils-бэкенд.
+    # Names that actually exist in the deepghs/anime_person_detection repo
+    # (+ old yv11 via realutils). The _yv11 suffix = realutils backend.
     PERSON_MODELS = [
         "person_detect_v1.3_s", "person_detect_v1.2_s",
         "person_detect_v1.1_m", "person_detect_v1.1_s", "person_detect_v1.1_n",
@@ -300,7 +300,7 @@ class DeepghsCharSeg:
         pil = _tensor_to_pil(image)
         w, h = pil.size
 
-        # --- 1) глобальный силуэт переднего плана ---
+        # --- 1) global foreground silhouette ---
         # segment_rgba_with_isnetis -> (mask_ndarray, rgba_image)
         seg_mask, _ = segment_rgba_with_isnetis(pil)
         seg = np.asarray(seg_mask).astype(np.float32)
@@ -310,21 +310,21 @@ class DeepghsCharSeg:
             seg = seg / 255.0
         if seg.shape != (h, w):
             seg = cv2.resize(seg, (w, h), interpolation=cv2.INTER_LINEAR)
-        fg = (seg > 0.5).astype(np.uint8)  # 1 = персонаж, 0 = фон
+        fg = (seg > 0.5).astype(np.uint8)  # 1 = character, 0 = background
 
-        # --- 2) детект (боксы + сиды зон) ---
-        # head надёжнее на слипшихся/лежачих позах — головы раздельны,
-        # даже когда тела сливаются в одно пятно, и центр головы ВСЕГДА на
-        # персонаже (в отличие от центра бокса тела, который уезжает на
-        # лежачих/диагональных позах). deepghs: head-детект пригоден для
-        # автоматизации, person — ещё дорабатывается.
+        # --- 2) detect (boxes + zone seeds) ---
+        # head is more reliable on stuck-together / lying poses — heads stay
+        # separate even when bodies merge into one blob, and a head center is
+        # ALWAYS on the character (unlike a body-box center, which drifts off on
+        # lying / diagonal poses). deepghs: head detect is good enough for
+        # automation, person detect is still being improved.
         #
-        # boxes       — габариты (экстент) для silhouette-режима и метаданных
-        # confs       — уверенности
-        # seeds       — одна точка-якорь на персонажа (для Вороной-дивайдеров)
-        # multi_seeds — список точек на персонажа (для watershed; от позы — весь скелет)
-        multi_seeds = None  # заполняется только в режиме pose
-        pose_bodies = None  # полные скелеты для рендера pose_image (режим pose)
+        # boxes       — extent for silhouette mode and metadata
+        # confs       — confidences
+        # seeds       — one anchor point per character (for Voronoi dividers)
+        # multi_seeds — list of points per character (for watershed; from a pose — the whole skeleton)
+        multi_seeds = None  # filled only in pose mode
+        pose_bodies = None  # full skeletons for the pose_image render (pose mode)
 
         if detect_target == "head":
             boxes, confs = detect_heads_backend(
@@ -337,13 +337,13 @@ class DeepghsCharSeg:
             seeds = [_center(b) for b in boxes]
 
         elif detect_target == "pose":
-            # DWPose: скелет на каждого. Мульти-сиды по телу -> зоны делятся
-            # по реальному телу даже на лежачих/внахлёст позах.
-            # ВНИМАНИЕ: cfgs уходят прямо в detect_person внутри dwpose, минуя
-            # наш fallback _call_det. max_infer_size сюда НЕ кладём — не все
-            # версии imgutils его принимают (иначе TypeError без отката).
-            # боксы тел берём от силуэта+голов, а не от внутреннего detect_person
-            # (на аниме он даёт кривые/мелкие боксы -> рассыпанный скелет)
+            # DWPose: a skeleton per character. Multi-seeds along the body -> zones
+            # split by the real body even on lying / overlapping poses.
+            # NOTE: cfgs go straight into detect_person inside dwpose, bypassing
+            # our _call_det fallback. We do NOT pass max_infer_size here — not all
+            # imgutils versions accept it (else TypeError with no fallback).
+            # body boxes come from silhouette+heads, not the internal detect_person
+            # (on anime it gives skewed/tiny boxes -> a scattered skeleton)
             ph_boxes, ph_confs = detect_heads_backend(
                 pil, conf_threshold, iou_threshold, max_infer_size)
             ph_boxes, ph_confs = _dedup_boxes(ph_boxes, ph_confs, 0.05 * min(w, h))
@@ -356,61 +356,61 @@ class DeepghsCharSeg:
                 multi_seeds = [p["points"] for p in poses]
                 pose_bodies = [p["body18"] for p in poses]
             else:
-                # поза не найдена -> откат на гибрид head+person
+                # no pose found -> fall back to the head+person hybrid
                 boxes, confs = detect_person_backend(
                     pil, person_model, conf_threshold, iou_threshold, max_infer_size)
                 seeds = [_center(b) for b in boxes]
 
-        else:  # person+head (гибрид): счётчик и сиды от голов, габариты от тел
+        else:  # person+head (hybrid): count and seeds from heads, extent from bodies
             head_boxes, head_confs = detect_heads_backend(
                 pil, conf_threshold, iou_threshold, max_infer_size)
             person_boxes, _person_confs = detect_person_backend(
                 pil, person_model, conf_threshold, iou_threshold, max_infer_size)
 
-            # дедуп голов: убрать дубли ближе ~5% от меньшей стороны кадра
+            # head dedup: drop duplicates closer than ~5% of the smaller frame side
             min_dist = 0.05 * min(w, h)
             head_boxes, head_confs = _dedup_boxes(head_boxes, head_confs, min_dist)
 
             if head_boxes:
-                # головы — авторитетный счётчик; габариты берём от сопоставленного тела
+                # heads are the authoritative count; extent comes from the matched body
                 boxes, confs, seeds = [], [], []
                 for hb, hc in zip(head_boxes, head_confs):
                     pb = _match_head_to_person(hb, person_boxes)
-                    boxes.append(pb if pb is not None else hb)  # экстент тела, иначе голова
+                    boxes.append(pb if pb is not None else hb)  # body extent, else the head
                     confs.append(hc)
-                    seeds.append(_center(hb))                   # якорь зоны = центр головы
+                    seeds.append(_center(hb))                   # zone anchor = head center
             else:
-                # головы не найдены -> откат на тела
+                # no heads found -> fall back to bodies
                 boxes, confs = person_boxes, _person_confs
                 seeds = [_center(b) for b in boxes]
 
-        # --- 3) построение масок ---
+        # --- 3) build masks ---
         # mask_mode:
-        #   silhouette — точная маска тела (силуэт ∩ бокс), для постобработки/детейлинга
-        #   zones      — каждый персонаж получает СВОЮ СТОРОНУ кадра до разделителя,
-        #                форма любая, покрытие кадра полное (для регионалки/генерации)
+        #   silhouette — precise body mask (silhouette ∩ box), for postprocess/detailing
+        #   zones      — each character gets ITS OWN SIDE of the frame up to the divider,
+        #                any shape, full frame coverage (for regional / generation)
         masks_out, boxes_meta = [], []
         if boxes:
-            # сиды зон: в гибриде = центры голов (на персонаже), иначе центры боксов
+            # zone seeds: in the hybrid = head centers (on the character), else box centers
             centers = seeds if seeds and len(seeds) == len(boxes) \
                 else [_center(b) for b in boxes]
             yy, xx = np.mgrid[0:h, 0:w]
 
-            # карта принадлежности пикселей (для zones): индекс ближайшего персонажа
+            # pixel-ownership map (for zones): index of the nearest character
             owner = None
             if mask_mode == "zones":
                 if divider == "straight" and len(centers) == 2:
-                    # прямой разделитель: перпендикуляр посередине между центрами.
-                    # пиксель относится к тому центру, к которому он ближе вдоль
-                    # оси, соединяющей центры (даёт ровную прямую границу)
+                    # straight divider: the perpendicular bisector between the centers.
+                    # a pixel belongs to whichever center it is closer to along the
+                    # axis joining the centers (gives a clean straight border)
                     (ax, ay), (bx, by) = centers[0], centers[1]
                     dx, dy = bx - ax, by - ay
                     mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
-                    # знак скалярного произведения (P-M)·(B-A): <0 -> сторона A
+                    # sign of the dot product (P-M)·(B-A): <0 -> side A
                     side = (xx - mx) * dx + (yy - my) * dy
-                    owner = (side > 0).astype(np.int32)  # 0 -> перс.0, 1 -> перс.1
+                    owner = (side > 0).astype(np.int32)  # 0 -> char 0, 1 -> char 1
                 elif divider == "nearest_silhouette":
-                    # пиксель отходит персонажу, чьё ТЕЛО ближе (по distance transform)
+                    # a pixel goes to the character whose BODY is closer (by distance transform)
                     dmaps = []
                     for i, b in enumerate(boxes):
                         bm = np.zeros((h, w), np.uint8)
@@ -421,22 +421,22 @@ class DeepghsCharSeg:
                         body = (fg & bm).astype(np.uint8)
                         if body.sum() == 0:
                             body = bm
-                        # расстояние до ближайшего пикселя тела персонажа i
+                        # distance to the nearest body pixel of character i
                         inv = (1 - body).astype(np.uint8)
                         dmaps.append(cv2.distanceTransform(inv, cv2.DIST_L2, 3))
                     owner = np.argmin(np.stack(dmaps), axis=0).astype(np.int32)
                 elif divider == "watershed":
-                    # граница идёт по РЕАЛЬНЫМ краям картинки (контур кожи/одежды),
-                    # а не по прямой. Сиды — центры голов; заливка watershed
-                    # разводит тела по визуальному шву. Для лежачих/внахлёст поз.
+                    # the border follows the REAL image edges (skin/clothing contour),
+                    # not a straight line. Seeds are head centers; the watershed flood
+                    # parts the bodies along the visual seam. For lying / overlapping poses.
                     n_c = len(centers)
                     markers = np.zeros((h, w), np.int32)
-                    # фон (вне силуэта) — отдельный маркер, чтобы не съедал тела
+                    # background (outside the silhouette) — its own marker so it doesn't eat bodies
                     markers[fg == 0] = n_c + 1
                     seed_r = max(3, int(0.012 * min(h, w)))
                     for i in range(n_c):
-                        # в режиме pose — весь скелет персонажа как сиды (заливка
-                        # идёт по телу), иначе одна точка-якорь
+                        # in pose mode — the character's whole skeleton as seeds (the flood
+                        # runs along the body), else a single anchor point
                         pts = multi_seeds[i] if (multi_seeds and i < len(multi_seeds)) \
                             else [centers[i]]
                         for (cx, cy) in pts:
@@ -446,14 +446,14 @@ class DeepghsCharSeg:
                     owner = np.full((h, w), -1, np.int32)
                     for i in range(n_c):
                         owner[markers == i + 1] = i
-                    # фон, границы (-1) и непоглощённое -> ближайший центр (полное покрытие)
+                    # background, borders (-1) and unclaimed -> nearest center (full coverage)
                     leftover = owner < 0
                     if leftover.any():
                         dmaps = [((xx - cx) ** 2 + (yy - cy) ** 2) for (cx, cy) in centers]
                         nearest = np.argmin(np.stack(dmaps), axis=0).astype(np.int32)
                         owner[leftover] = nearest[leftover]
                 else:
-                    # nearest_center: ближайший центр (Вороной), граница авто-изгибается
+                    # nearest_center: nearest center (Voronoi), the border auto-curves
                     dmaps = []
                     for (cx, cy) in centers:
                         dmaps.append((xx - cx) ** 2 + (yy - cy) ** 2)
@@ -461,9 +461,9 @@ class DeepghsCharSeg:
 
             for i, b in enumerate(boxes):
                 if mask_mode == "zones":
-                    m = (owner == i).astype(np.uint8)  # вся сторона персонажа
+                    m = (owner == i).astype(np.uint8)  # the character's whole side
                 else:
-                    # silhouette: точная маска тела
+                    # silhouette: precise body mask
                     box_mask = np.zeros((h, w), np.uint8)
                     x0, y0, x1, y1 = [int(v) for v in b]
                     x0, y0 = max(0, x0), max(0, y0)
@@ -493,7 +493,7 @@ class DeepghsCharSeg:
                     masks_out.append(m)
                     boxes_meta.append({"bbox": b, "conf": confs[i], "area": int(m.sum())})
 
-        # сортировка
+        # sorting
         if masks_out:
             idx = list(range(len(masks_out)))
             if sort_order == "left_to_right":
@@ -505,7 +505,7 @@ class DeepghsCharSeg:
             masks_out = [masks_out[i] for i in idx]
             boxes_meta = [boxes_meta[i] for i in idx]
 
-        # --- выходы ---
+        # --- outputs ---
         if masks_out:
             stack = np.stack(masks_out).astype(np.float32)
             instance_masks = torch.from_numpy(stack)
@@ -514,7 +514,7 @@ class DeepghsCharSeg:
             instance_masks = _empty_mask(h, w)
             combined = torch.from_numpy(fg.astype(np.float32)).unsqueeze(0)
 
-        # превью: арт + цветные маски + боксы
+        # preview: art + colored masks + boxes
         prev = np.array(pil).astype(np.uint8).copy()
         palette = [(255, 80, 80), (80, 160, 255), (80, 255, 120),
                    (255, 220, 80), (220, 80, 255), (80, 255, 240)]
@@ -527,8 +527,8 @@ class DeepghsCharSeg:
             cv2.rectangle(prev, (x0, y0), (x1, y1), color, 3)
         preview = torch.from_numpy(prev.astype(np.float32) / 255.0).unsqueeze(0)
 
-        # pose_image: скелет OpenPose (под ControlNet). В режиме pose рисуем
-        # из скелетов, иначе чёрный холст (выход всегда существует).
+        # pose_image: OpenPose skeleton (for ControlNet). In pose mode we draw
+        # from skeletons, else a black canvas (the output always exists).
         pose_np = render_openpose(h, w, pose_bodies) if pose_bodies \
             else np.zeros((h, w, 3), dtype=np.uint8)
         pose_image = torch.from_numpy(pose_np.astype(np.float32) / 255.0).unsqueeze(0)
