@@ -1,4 +1,4 @@
-"""Офлайн-тесты scene_nodes (JSON Scene Book) без comfy."""
+"""Offline tests for scene_nodes (JSON Scene Book) without comfy."""
 import importlib.util
 import json
 import os
@@ -34,42 +34,42 @@ BOOK = json.dumps({
 })
 
 r1 = sn.load_scene_book(BOOK, 1)
-check("index 1: имя", r1["name"] == "one", r1["name"])
-check("index 1: prompt без префикса",
+check("index 1: name", r1["name"] == "one", r1["name"])
+check("index 1: prompt without prefix",
       r1["prompt"].startswith("[SCENE] a") and "[QUALITY]" not in r1["prompt"])
-check("index 1: prefix отдельно", r1["prefix"] == "[QUALITY] q\n[STYLE] s")
+check("index 1: prefix separate", r1["prefix"] == "[QUALITY] q\n[STYLE] s")
 check("index 1: full = prefix + prompt",
       r1["full_prompt"].startswith("[QUALITY] q") and "[SCENE] a" in r1["full_prompt"])
 check("index 1: char_points", r1["char_points"] == "0.3,0.5; 0.7,0.5")
 check("count", r1["count"] == 3, str(r1["count"]))
 
 r2 = sn.load_scene_book(BOOK, 2)
-check("index 2: имя", r2["name"] == "two")
+check("index 2: name", r2["name"] == "two")
 
 r3 = sn.load_scene_book(BOOK, 3)
-check("строка-сцена: prompt", r3["prompt"] == "just a string scene")
-check("строка-сцена: char_points пустой", r3["char_points"] == "")
-check("строка-сцена: имя по умолчанию", r3["name"] == "scene 3", r3["name"])
+check("string scene: prompt", r3["prompt"] == "just a string scene")
+check("string scene: char_points empty", r3["char_points"] == "")
+check("string scene: default name", r3["name"] == "scene 3", r3["name"])
 
-# clamp (без wrap): за пределами -> последний
+# clamp (no wrap): out of range -> last
 rc = sn.load_scene_book(BOOK, 99, wrap=False)
-check("clamp: индекс за пределами -> последний", rc["index"] == 3, str(rc["index"]))
+check("clamp: index out of range -> last", rc["index"] == 3, str(rc["index"]))
 rc0 = sn.load_scene_book(BOOK, 0, wrap=False)
-check("clamp: 0 -> первый", rc0["index"] == 1, str(rc0["index"]))
+check("clamp: 0 -> first", rc0["index"] == 1, str(rc0["index"]))
 
-# wrap: зацикливание
+# wrap: cycling
 rw = sn.load_scene_book(BOOK, 4, wrap=True)
-check("wrap: 4 -> 1 (3 сцены)", rw["index"] == 1, str(rw["index"]))
+check("wrap: 4 -> 1 (3 scenes)", rw["index"] == 1, str(rw["index"]))
 rw5 = sn.load_scene_book(BOOK, 5, wrap=True)
 check("wrap: 5 -> 2", rw5["index"] == 2, str(rw5["index"]))
 
-# синонимы ключей
+# key synonyms
 ALT = json.dumps({"prefix": "P", "scenes": [{"body": "B", "points": "0,0; 1,1"}]})
 ra = sn.load_scene_book(ALT, 1)
-check("синонимы scenes/body/points",
+check("synonyms scenes/body/points",
       ra["prompt"] == "B" and ra["char_points"] == "0,0; 1,1")
 
-# ── ориентация (horizontal) ─────────────────────────────────────────────────
+# ── orientation (horizontal) ───────────────────────────────────────────────
 ORI = json.dumps({"prefix": "P", "prompts": [
     {"prompt": "a", "horizontal": True},
     {"prompt": "b", "horizontal": False},
@@ -77,37 +77,37 @@ ORI = json.dumps({"prefix": "P", "prompts": [
     {"prompt": "d", "ratio": "9:16"},
     {"prompt": "e"},
 ]})
-check("ориентация: bool true", sn.load_scene_book(ORI, 1)["horizontal"] is True)
-check("ориентация: bool false", sn.load_scene_book(ORI, 2)["horizontal"] is False)
-check("ориентация: 16:9 -> true", sn.load_scene_book(ORI, 3)["horizontal"] is True)
-check("ориентация: 9:16 -> false", sn.load_scene_book(ORI, 4)["horizontal"] is False)
-check("ориентация: не задано -> default True",
+check("orientation: bool true", sn.load_scene_book(ORI, 1)["horizontal"] is True)
+check("orientation: bool false", sn.load_scene_book(ORI, 2)["horizontal"] is False)
+check("orientation: 16:9 -> true", sn.load_scene_book(ORI, 3)["horizontal"] is True)
+check("orientation: 9:16 -> false", sn.load_scene_book(ORI, 4)["horizontal"] is False)
+check("orientation: unset -> default True",
       sn.load_scene_book(ORI, 5, default_horizontal=True)["horizontal"] is True)
-check("ориентация: не задано -> default False",
+check("orientation: unset -> default False",
       sn.load_scene_book(ORI, 5, default_horizontal=False)["horizontal"] is False)
 
-# нет промптов -> ошибка
+# no prompts -> error
 try:
     sn.load_scene_book(json.dumps({"prefix": "x", "prompts": []}), 1)
-    check("пустой список -> ошибка", False)
+    check("empty list -> error", False)
 except ValueError:
-    check("пустой список -> ошибка", True)
+    check("empty list -> error", True)
 
-# пример-JSON из репозитория валиден и читается
+# example JSON from the repo is valid and readable
 ex = os.path.join(FOLDER, "example_workflows", "scenes_columbina_fischl.json")
 if os.path.isfile(ex):
-    re = sn.load_scene_book(ex, 1)   # путь к файлу, не текст
-    check("пример-JSON: читается по пути", re["count"] == 4, str(re["count"]))
-    check("пример-JSON: full содержит префикс и сцену",
+    re = sn.load_scene_book(ex, 1)   # file path, not text
+    check("example JSON: readable by path", re["count"] == 4, str(re["count"]))
+    check("example JSON: full contains prefix and scene",
           "[QUALITY]" in re["full_prompt"] and "[SCENE]" in re["full_prompt"])
-    check("пример-JSON: char_points есть", "," in re["char_points"], re["char_points"])
-    check("пример-JSON: сцена 1 горизонтальная (лежат сверху)",
+    check("example JSON: char_points present", "," in re["char_points"], re["char_points"])
+    check("example JSON: scene 1 horizontal (lying on top)",
           re["horizontal"] is True, str(re["horizontal"]))
-    check("пример-JSON: сцена 2 вертикальная",
+    check("example JSON: scene 2 vertical",
           sn.load_scene_book(ex, 2)["horizontal"] is False)
 else:
-    check("пример-JSON присутствует", False, "файл не найден")
+    check("example JSON present", False, "file not found")
 
 print()
-print("ИТОГ:", "все тесты прошли" if not fails else f"ПРОВАЛЕНО: {fails}")
+print("SUMMARY:", "all tests passed" if not fails else f"FAILED: {fails}")
 sys.exit(1 if fails else 0)
