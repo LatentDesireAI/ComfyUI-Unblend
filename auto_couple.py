@@ -2304,6 +2304,16 @@ class UnblendSequentialRefine:
                 "harmonize_denoise": ("FLOAT", {"default": 0.18, "min": 0.0, "max": 0.6, "step": 0.02}),
                 "mask_feather": ("INT", {"default": 4, "min": 0, "max": 32}),
                 "subject_word": ("STRING", {"default": "girl"}),
+                # crop-upscale детейл: каждого персонажа кропим по его маске,
+                # апскейлим кроп до detail_size и перерисовываем ТАМ — лицо
+                # занимает большую долю кадра => чёткие черты даже у мелкого
+                # героя на горизонтали. Выкл = старый масочный img2img на
+                # латенте всего кадра (обратная совместимость).
+                "per_char_upscale": ("BOOLEAN", {"default": False}),
+                # целевая длинная сторона кропа персонажа перед рефайном.
+                "detail_size": ("INT", {"default": 1024, "min": 512, "max": 2048, "step": 64}),
+                # запас контекста вокруг bbox маски (1.0 = впритык). 1.3-1.6.
+                "crop_factor": ("FLOAT", {"default": 1.4, "min": 1.0, "max": 3.0, "step": 0.1}),
             },
         }
 
@@ -2312,10 +2322,78 @@ class UnblendSequentialRefine:
     FUNCTION = "run"
     CATEGORY = "Unblend"
 
+    @staticmethod
+    def _crop_detail_one(model, vae, image, mask_img, pos, neg_cond,
+                         seed, steps, cfg, sampler_name, scheduler,
+                         denoise, detail_size, crop_factor, mask_feather):
+        """Кроп персонажа по маске -> апскейл до detail_size -> масочный
+        img2img ТОЛЬКО его промптом -> вклейка обратно по перу маски (за
+        пределами маски пиксели не трогаем). Возвращает (image, лог).
+
+        Смысл: на латенте кропа лицо занимает большую долю кадра, поэтому
+        SDXL рисует чёткие черты — в отличие от масочного прохода на латенте
+        всего кадра, где мелкий герой получает крохи разрешения."""
+        import comfy.sample
+        import comfy.utils
+
+        H, W = image.shape[1], image.shape[2]
+        ys, xs = torch.where(mask_img > 0.1)
+        if ys.numel() == 0:
+            return image, "пустой bbox — пропуск"
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+        nw = min(W, max(8, int(round((x1 - x0) * crop_factor))))
+        nh = min(H, max(8, int(round((y1 - y0) * crop_factor))))
+        x0 = int(min(max(0, round(cx - nw / 2)), W - nw))
+        y0 = int(min(max(0, round(cy - nh / 2)), H - nh))
+        x1, y1 = x0 + nw, y0 + nh
+
+        crop = image[:, y0:y1, x0:x1, :]                  # (B, nh, nw, C)
+        cmask = mask_img[y0:y1, x0:x1]                    # (nh, nw)
+
+        # длинную сторону кропа -> detail_size (только вверх), кратно 8
+        scale = max(1.0, float(detail_size) / float(max(nh, nw)))
+        tw = max(8, int(round(nw * scale / 8)) * 8)
+        th = max(8, int(round(nh * scale / 8)) * 8)
+
+        up = comfy.utils.common_upscale(
+            crop.movedim(-1, 1), tw, th, "bicubic", "disabled").movedim(1, -1)
+        lat = vae.encode(up[:, :, :, :3])
+        lh, lw = lat.shape[-2], lat.shape[-1]
+
+        # маска кропа -> размер кропа -> перо -> латент (noise_mask)
+        m_up = F.interpolate(cmask.reshape(1, 1, nh, nw), size=(th, tw),
+                             mode="bilinear", align_corners=False)
+        m_up = feather_masks(m_up.squeeze(1), mask_feather)          # (1, th, tw)
+        m_lat = F.interpolate(m_up.unsqueeze(1), size=(lh, lw),
+                              mode="bilinear", align_corners=False)
+
+        noise = comfy.sample.prepare_noise(lat, seed, None)
+        out_lat = comfy.sample.sample(
+            model, noise, steps, cfg, sampler_name, scheduler,
+            pos, neg_cond, lat,
+            denoise=denoise, disable_noise=False,
+            start_step=None, last_step=None, force_full_denoise=False,
+            noise_mask=m_lat, callback=None,
+            disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed)
+        det = vae.decode(out_lat)                         # (B, th, tw, C)
+
+        # назад к размеру кропа и вклейка по перу (меняем только персонажа)
+        det = comfy.utils.common_upscale(
+            det.movedim(-1, 1), nw, nh, "bicubic", "disabled").movedim(1, -1)
+        det = det.to(image.device, image.dtype)
+        alpha = feather_masks(cmask.reshape(1, nh, nw), mask_feather)[0]
+        alpha = alpha.clamp(0, 1).reshape(1, nh, nw, 1).to(image.device, image.dtype)
+        out = image.clone()
+        out[:, y0:y1, x0:x1, :] = det * alpha + crop * (1 - alpha)
+        return out, f"crop {nw}x{nh} -> {tw}x{th} @ denoise {denoise}"
+
     def run(self, model, clip, vae, image, char_masks, prompt, negative_prompt,
             seed, steps, cfg, sampler_name, scheduler, refine_denoise=0.45,
             background_denoise=0.3, harmonize_denoise=0.18, mask_feather=4,
-            subject_word="girl"):
+            subject_word="girl", per_char_upscale=False, detail_size=1024,
+            crop_factor=1.4):
         import comfy.sample
         import comfy.utils
 
@@ -2354,39 +2432,67 @@ class UnblendSequentialRefine:
             print(f"[UnblendSeqRefine] {info_str}")
             return (out_image, preview, info_str)
 
-        # ── маски -> латентное разрешение + перо ────────────────────────────
+        # ── маски: латентные (перо) для фон-прохода/превью + пиксельные ──────
+        #    cm_img (пиксельные) нужны crop-детейлу для bbox и вклейки.
         cm = char_masks
         if cm.dim() == 2:
             cm = cm.unsqueeze(0)
         cm = cm.float()
+        H, W = image.shape[1], image.shape[2]
+        cm_img = F.interpolate(cm.unsqueeze(1), size=(H, W),
+                               mode="bilinear", align_corners=False).squeeze(1)
         cm = F.interpolate(cm.unsqueeze(1), size=(h_lat, w_lat),
                            mode="bilinear", align_corners=False).squeeze(1)
         cm = feather_masks(cm, mask_feather)            # (n, h_lat, w_lat)
 
-        # ── по очереди: масочный img2img каждого персонажа ──────────────────
+        # ── по очереди добиваем каждого персонажа ───────────────────────────
         done = []
-        for k, i in enumerate(present_idx):
-            if i >= cm.shape[0]:
-                info.append(f"CHAR{i+1}: нет маски — пропуск")
-                continue
-            mask = cm[i]
-            if float(mask.max()) < 0.02:
-                info.append(f"CHAR{i+1}: пустая маска — пропуск")
-                continue
-            pos = UnblendBoundedSampler._encode(
-                clip, sequential_char_prompt(sections, char_texts[i], subj))
-            mask_lat = mask.view(1, 1, h_lat, w_lat)
-            noise = comfy.sample.prepare_noise(cur, seed + k, None)
-            cur = comfy.sample.sample(
-                model, noise, steps, cfg, sampler_name, scheduler,
-                pos, neg_cond, cur,
-                denoise=refine_denoise, disable_noise=False,
-                start_step=None, last_step=None, force_full_denoise=False,
-                noise_mask=mask_lat, callback=None,
-                disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed + k)
-            done.append(i + 1)
+        if per_char_upscale:
+            # crop -> upscale -> масочный img2img на кропе -> вклейка. Лицо
+            # занимает большую долю латента кропа => чёткие черты даже у
+            # мелкого персонажа на горизонтали. Работаем в пикселях кадра.
+            work = image.clone()
+            for k, i in enumerate(present_idx):
+                if i >= cm_img.shape[0]:
+                    info.append(f"CHAR{i+1}: нет маски — пропуск")
+                    continue
+                if float(cm_img[i].max()) < 0.02:
+                    info.append(f"CHAR{i+1}: пустая маска — пропуск")
+                    continue
+                pos = UnblendBoundedSampler._encode(
+                    clip, sequential_char_prompt(sections, char_texts[i], subj))
+                work, msg = self._crop_detail_one(
+                    model, vae, work, cm_img[i], pos, neg_cond,
+                    seed + k, steps, cfg, sampler_name, scheduler,
+                    refine_denoise, detail_size, crop_factor, mask_feather)
+                info.append(f"CHAR{i+1}: {msg}")
+                done.append(i + 1)
+            cur = vae.encode(work[:, :, :, :3])   # назад в латент для фона/швов
+        else:
+            # старое поведение: масочный img2img на латенте ВСЕГО кадра
+            for k, i in enumerate(present_idx):
+                if i >= cm.shape[0]:
+                    info.append(f"CHAR{i+1}: нет маски — пропуск")
+                    continue
+                mask = cm[i]
+                if float(mask.max()) < 0.02:
+                    info.append(f"CHAR{i+1}: пустая маска — пропуск")
+                    continue
+                pos = UnblendBoundedSampler._encode(
+                    clip, sequential_char_prompt(sections, char_texts[i], subj))
+                mask_lat = mask.view(1, 1, h_lat, w_lat)
+                noise = comfy.sample.prepare_noise(cur, seed + k, None)
+                cur = comfy.sample.sample(
+                    model, noise, steps, cfg, sampler_name, scheduler,
+                    pos, neg_cond, cur,
+                    denoise=refine_denoise, disable_noise=False,
+                    start_step=None, last_step=None, force_full_denoise=False,
+                    noise_mask=mask_lat, callback=None,
+                    disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED, seed=seed + k)
+                done.append(i + 1)
 
-        info.append(f"рефайн CHAR{done} @ denoise {refine_denoise}")
+        info.append(f"рефайн CHAR{done} @ denoise {refine_denoise}"
+                    + (f" (crop->{detail_size})" if per_char_upscale else ""))
 
         # ── проход по ФОНУ: инверсная зона + промпт сцены (без персонажей) ──
         # детализирует локацию/свет, героев не трогает (они вне маски фона).
