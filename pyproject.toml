@@ -2,6 +2,7 @@
 name = "comfyui-unblend"
 description = "Character separation for anime art in ComfyUI: detection, instance masks, exclusive regions, prompt routing and pose extraction — fixes character blending on multi-character images."
 version = "0.2.0"
+requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [{ name = "LatentDesireAI", email = "latentdesire@pm.me" }]
 dependencies = [

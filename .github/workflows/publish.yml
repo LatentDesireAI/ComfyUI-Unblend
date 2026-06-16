@@ -1,0 +1,34 @@
+name: Publish to Comfy Registry
+
+# Publishes the node pack to registry.comfy.org (which ComfyUI Manager reads),
+# so it shows up in the Manager's "Install via search". Runs when the version in
+# pyproject.toml changes on main, or manually from the Actions tab.
+#
+# One-time setup: create a publisher at registry.comfy.org whose ID matches
+# [tool.comfy] PublisherId in pyproject.toml, generate an API key, and add it as
+# a repository secret named REGISTRY_ACCESS_TOKEN
+# (Settings -> Secrets and variables -> Actions).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"   # bump `version` to publish a new release
+
+permissions:
+  issues: write
+
+jobs:
+  publish-node:
+    name: Publish custom node to the registry
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'LatentDesireAI' }}
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Publish custom node
+        uses: Comfy-Org/publish-node-action@v1
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
