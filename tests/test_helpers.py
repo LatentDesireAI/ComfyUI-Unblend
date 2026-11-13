@@ -138,7 +138,31 @@ check("lcm", ac._lcm_list([77, 154, 231]) == 462)
 chunks = [[(49406, 1.0), (320, 1.0), (torch.zeros(3), 1.0), (49407, 1.0)]]
 flat = ac.flatten_token_ids(chunks)
 check("flatten embedding -> -1", flat == [49406, 320, -1, 49407], str(flat))
-check("strip specials", ac.strip_specials(flat) == [320, -1])
+
+
+# 9. find_char_spans: a CHARn block that crosses a 77-token chunk boundary
+class _ChunkClip:
+    """Tokenizes space-separated ints into chunks of `size` content tokens, each wrapped
+    in start/end and padded with 0, like SDXL CLIP-G."""
+
+    def __init__(self, size):
+        self.size = size
+
+    def tokenize(self, text):
+        ids = [int(t) for t in text.split()]
+        chunks = []
+        for i in range(0, max(len(ids), 1), self.size):
+            body = ids[i:i + self.size]
+            pad = [0] * (self.size - len(body))
+            chunks.append([(t, 1.0) for t in [49406, *body, 49407, *pad]])
+        return {"g": chunks}
+
+
+clip = _ChunkClip(4)
+draw = "1 2 3 4 5 6"  # chunk 1: 1 2 3 4, chunk 2: 5 6 -> CHAR "3 4 5 6" crosses it
+spans, _ = ac.find_char_spans(clip, draw, ["3 4 5 6", "1 2"])
+check("char span across chunk boundary", spans[0] == [3, 4, 7, 8], str(spans[0]))
+check("char span inside one chunk", spans[1] == [1, 2], str(spans[1]))
 
 print()
 print("SUMMARY:", "all tests passed" if not fails else f"FAILED: {fails}")

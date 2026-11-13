@@ -45,6 +45,10 @@ from .prompt_builder import build_blocks, parse_prompt, _clean, _join, _subject_
 
 _CLIP_START = 49406
 _CLIP_END = 49407
+# SDXL CLIP-G pads chunks with token 0 (the vocab's "!"), not with the end token. Span
+# matching skips it in both prompt and block, so a literal "!" is ignored symmetrically.
+_CLIP_PAD = 0
+_CHUNK_FILLERS = frozenset({_CLIP_START, _CLIP_END, _CLIP_PAD})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -63,15 +67,6 @@ def flatten_token_ids(tokenized_chunks):
             tok = entry[0]
             flat.append(int(tok) if isinstance(tok, (int, np.integer)) else -1)
     return flat
-
-
-def strip_specials(ids):
-    """Strip CLIP start/end/pad tokens from the edges and trailing end repeats."""
-    out = [t for t in ids if t not in (_CLIP_START,)]
-    # trailing end tokens (ComfyUI padding fills with ends or zeros)
-    while out and out[-1] in (_CLIP_END, 0):
-        out.pop()
-    return [t for t in out if t != _CLIP_END]
 
 
 def find_subsequence(haystack, needle):
@@ -556,14 +551,21 @@ def find_char_spans(clip, draw_text, char_texts):
     toks = clip.tokenize(draw_text)
     key = "g" if "g" in toks else ("l" if "l" in toks else next(iter(toks)))
     hay = flatten_token_ids(toks[key])
+    # A long prompt spans several 77-token chunks, each wrapped in start/end tokens and
+    # possibly padded where the tokenizer moved a word to the next chunk. Match against
+    # the content tokens only, then map back to real positions, so a CHARn block that
+    # crosses a chunk boundary is still found.
+    content = [p for p, tok in enumerate(hay) if tok not in _CHUNK_FILLERS]
+    content_ids = [hay[p] for p in content]
     spans, needles = {}, {}
     for i, ct in enumerate(char_texts):
         if not ct:
             spans[i], needles[i] = None, None
             continue
         sub = clip.tokenize(ct)
-        needles[i] = strip_specials(flatten_token_ids(sub[key]))
-        spans[i] = find_subsequence(hay, needles[i])
+        needles[i] = [t for t in flatten_token_ids(sub[key]) if t not in _CHUNK_FILLERS]
+        found = find_subsequence(content_ids, needles[i])
+        spans[i] = [content[p] for p in found] if found else None
     return spans, distinctive_positions(spans, needles)
 
 
